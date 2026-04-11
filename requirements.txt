@@ -4,22 +4,23 @@
 
 # Core ML Framework
 torch>=2.2.0
-transformers>=4.40.0
+transformers>=4.51.0    # 4.51+ required for Gemma-4 architecture support
 datasets>=2.18.0
 accelerate>=0.27.0
 
 # PEFT (Parameter-Efficient Fine-Tuning)
 peft>=0.10.0
 
-# Quantization for QLoRA
+# Quantization for QLoRA (training-time NF4) and NVFP4 export
 bitsandbytes>=0.43.0
+nvidia-modelopt[all]>=0.21.0   # NVFP4 post-training quantisation
 
 # Tokenization
 sentencepiece>=0.2.0
 tiktoken>=0.6.0
 
 # Training utilities
-trl>=0.8.0              # Transformer Reinforcement Learning
+trl>=0.12.0             # SFTTrainer with packing support
 wandb>=0.16.0           # Experiment tracking (optional)
 tensorboard>=2.16.0     # Training visualization
 
@@ -35,6 +36,7 @@ nltk>=3.8.0
 # Data processing
 pandas>=2.2.0
 numpy>=1.26.0
+pyarrow>=15.0.0         # Parquet support (fast columnar reads for 2.2M rows)
 
 # Utilities
 tqdm>=4.66.0

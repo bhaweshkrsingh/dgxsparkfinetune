@@ -4,10 +4,14 @@ DGX Spark Fine-Tuning Script
 =============================
 Optimized for NVIDIA DGX Spark's 128GB unified memory architecture.
 
-Supports multiple fine-tuning strategies:
-- Full fine-tuning (for smaller models, leverages full memory)
-- LoRA (Low-Rank Adaptation - memory efficient)
-- QLoRA (Quantized LoRA - maximum memory efficiency)
+Supports:
+  - Full fine-tuning  (small models <3B)
+  - LoRA              (medium models 3-13B)
+  - QLoRA             (large models 13B+, primary path for Gemma-4 31B)
+
+Primary use-case in this repo: QLoRA fine-tuning of Gemma-4-31B-IT on
+medical Q&A data stored as Parquet, using TRL SFTTrainer with sequence
+packing for maximum training throughput on the GB10 Blackwell GPU.
 
 Author: DGX Spark AI Development Series
 License: MIT
@@ -43,13 +47,14 @@ from peft import (
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('finetune.log')
-    ]
+        logging.FileHandler("finetune.log"),
+    ],
 )
 logger = logging.getLogger(__name__)
+
 
 # =============================================================================
 # DGX SPARK CONFIGURATION
@@ -57,56 +62,95 @@ logger = logging.getLogger(__name__)
 
 class DGXSparkConfig:
     """
-    Hardware-optimized configuration for NVIDIA DGX Spark.
-    
-    The DGX Spark features:
-    - NVIDIA Grace Blackwell architecture
-    - 128GB unified memory (CPU+GPU shared)
-    - NVLink-C2C interconnect (900 GB/s bandwidth)
-    - Up to 1 PFLOPS AI performance (FP4)
+    Hardware-optimised configuration for NVIDIA DGX Spark (GB10 Grace Blackwell).
+
+    Key specs:
+      - 128 GB LPDDR5X unified memory (CPU + GPU shared)
+      - 900 GB/s NVLink-C2C bandwidth
+      - ~250 TFLOPS BF16 / 1 PFLOPS FP4 AI performance
     """
-    
-    # Memory configuration (128GB unified)
+
     TOTAL_MEMORY_GB = 128
-    RECOMMENDED_MODEL_MEMORY_GB = 80  # Leave headroom for activations
-    
-    # Optimal batch sizes for different model sizes
+    RECOMMENDED_MODEL_MEMORY_GB = 80
+
+    # Per-device batch sizes (single GB10 device)
     BATCH_SIZE_RECOMMENDATIONS = {
-        "1B": {"full": 16, "lora": 32, "qlora": 64},
-        "3B": {"full": 8, "lora": 16, "qlora": 32},
-        "7B": {"full": 4, "lora": 8, "qlora": 16},
-        "13B": {"full": 2, "lora": 4, "qlora": 8},
-        "70B": {"full": 1, "lora": 2, "qlora": 4},
+        "1B":  {"full": 16, "lora": 32, "qlora": 64},
+        "3B":  {"full":  8, "lora": 16, "qlora": 32},
+        "7B":  {"full":  4, "lora":  8, "qlora": 16},
+        "13B": {"full":  2, "lora":  4, "qlora":  8},
+        "30B": {"full":  1, "lora":  2, "qlora":  2},   # Gemma-4-31B lives here
+        "70B": {"full":  1, "lora":  1, "qlora":  2},
     }
-    
-    # Gradient accumulation to simulate larger batches
+
     GRADIENT_ACCUMULATION = {
-        "1B": 1, "3B": 2, "7B": 4, "13B": 8, "70B": 16
+        "1B": 1, "3B": 2, "7B": 4, "13B": 8, "30B": 8, "70B": 16,
     }
-    
+
+    # Optimal learning rates per size & method
+    LEARNING_RATES = {
+        "1B":  {"full": 3e-4, "lora": 3e-4, "qlora": 3e-4},
+        "3B":  {"full": 2e-4, "lora": 2e-4, "qlora": 2e-4},
+        "7B":  {"full": 1e-4, "lora": 2e-4, "qlora": 2e-4},
+        "13B": {"full": 1e-4, "lora": 1e-4, "qlora": 1e-4},
+        "30B": {"full": 5e-5, "lora": 1e-4, "qlora": 1e-4},
+        "70B": {"full": 5e-5, "lora": 5e-5, "qlora": 5e-5},
+    }
+
     @classmethod
-    def get_optimal_settings(cls, model_size: str, method: str) -> Dict[str, int]:
-        """Get optimal training settings for model size and method."""
-        size_key = cls._get_size_key(model_size)
+    def get_optimal_settings(cls, model_name: str, method: str) -> Dict[str, Any]:
+        key = cls._get_size_key(model_name)
         return {
-            "batch_size": cls.BATCH_SIZE_RECOMMENDATIONS.get(size_key, {}).get(method, 4),
-            "gradient_accumulation": cls.GRADIENT_ACCUMULATION.get(size_key, 4)
+            "batch_size":           cls.BATCH_SIZE_RECOMMENDATIONS.get(key, {}).get(method, 4),
+            "gradient_accumulation": cls.GRADIENT_ACCUMULATION.get(key, 4),
+            "learning_rate":        cls.LEARNING_RATES.get(key, {}).get(method, 2e-4),
         }
-    
+
     @staticmethod
-    def _get_size_key(model_size: str) -> str:
-        """Map model size string to configuration key."""
-        size_lower = model_size.lower()
-        if "70b" in size_lower:
+    def _get_size_key(model_name: str) -> str:
+        s = model_name.lower()
+        if any(x in s for x in ["70b", "72b", "65b"]):
             return "70B"
-        elif "13b" in size_lower:
+        if any(x in s for x in ["30b", "31b", "32b", "34b"]):
+            return "30B"
+        if any(x in s for x in ["13b", "14b"]):
             return "13B"
-        elif "7b" in size_lower or "8b" in size_lower:
+        if any(x in s for x in ["7b", "8b"]):
             return "7B"
-        elif "3b" in size_lower:
+        if any(x in s for x in ["3b", "4b"]):
             return "3B"
-        else:
-            return "1B"
+        return "1B"
+
+    @staticmethod
+    def estimate_training_time(
+        num_samples: int,
+        avg_tokens_per_sample: int = 1200,
+        num_epochs: int = 1,
+        use_packing: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Rough wall-clock estimate for 31B QLoRA on DGX Spark GB10.
+
+        Assumptions:
+          - GB10 effective BF16 throughput: ~100 TFLOPS (40% of 250T peak)
+          - 31B model: ~300 GFLOP / token during QLoRA training
+          - Packing (SFTTrainer) eliminates padding waste: ~1.4× speedup
+        """
+        tokens_per_sec_base = 333          # without packing
+        packing_speedup     = 1.4 if use_packing else 1.0
+        tokens_per_sec      = tokens_per_sec_base * packing_speedup
+
+        total_tokens  = num_samples * avg_tokens_per_sample * num_epochs
+        total_seconds = total_tokens / tokens_per_sec
+        hours         = total_seconds / 3600
+        days          = hours / 24
+
+        return {
+            "total_tokens":  total_tokens,
+            "tokens_per_sec": int(tokens_per_sec),
+            "hours":         round(hours,  1),
+            "days":          round(days,   1),
+        }
 
 
 # =============================================================================
@@ -114,29 +158,36 @@ class DGXSparkConfig:
 # =============================================================================
 
 SUPPORTED_MODELS = {
-    # Llama family
+    # ── Gemma-4 (primary target for this repo) ───────────────────────────────
+    # NOTE: fine-tuning requires the standard BF16 HuggingFace weights.
+    # The nvidia/Gemma-4-31B-IT-NVFP4 model in your cache is inference-only.
+    # HuggingFace will download google/gemma-4-31b-it (~62 GB) automatically
+    # when you first run training (set HF_TOKEN in your environment).
+    "gemma-4-31b": "google/gemma-4-31b-it",
+
+    # ── Llama ────────────────────────────────────────────────────────────────
     "llama-3.2-1b": "meta-llama/Llama-3.2-1B",
     "llama-3.2-3b": "meta-llama/Llama-3.2-3B",
     "llama-3.1-8b": "meta-llama/Llama-3.1-8B",
-    
-    # Mistral family
-    "mistral-7b": "mistralai/Mistral-7B-v0.3",
+
+    # ── Mistral ──────────────────────────────────────────────────────────────
+    "mistral-7b":       "mistralai/Mistral-7B-v0.3",
     "mistral-nemo-12b": "mistralai/Mistral-Nemo-Instruct-2407",
-    
-    # Qwen family
+
+    # ── Qwen 2.5 ─────────────────────────────────────────────────────────────
     "qwen2.5-1.5b": "Qwen/Qwen2.5-1.5B",
-    "qwen2.5-3b": "Qwen/Qwen2.5-3B",
-    "qwen2.5-7b": "Qwen/Qwen2.5-7B",
-    
-    # Phi family (Microsoft)
-    "phi-3-mini": "microsoft/Phi-3-mini-4k-instruct",
+    "qwen2.5-3b":   "Qwen/Qwen2.5-3B",
+    "qwen2.5-7b":   "Qwen/Qwen2.5-7B",
+
+    # ── Phi-3 ────────────────────────────────────────────────────────────────
+    "phi-3-mini":  "microsoft/Phi-3-mini-4k-instruct",
     "phi-3-small": "microsoft/Phi-3-small-8k-instruct",
-    
-    # Gemma family (Google)
+
+    # ── Gemma-2 ──────────────────────────────────────────────────────────────
     "gemma-2-2b": "google/gemma-2-2b",
     "gemma-2-9b": "google/gemma-2-9b",
-    
-    # SmolLM (Hugging Face) - great for experimentation
+
+    # ── SmolLM ───────────────────────────────────────────────────────────────
     "smollm-135m": "HuggingFaceTB/SmolLM-135M",
     "smollm-360m": "HuggingFaceTB/SmolLM-360M",
     "smollm-1.7b": "HuggingFaceTB/SmolLM-1.7B",
@@ -148,118 +199,164 @@ SUPPORTED_MODELS = {
 # =============================================================================
 
 class DatasetPreparator:
-    """Prepare datasets for fine-tuning."""
-    
+    """
+    Prepare datasets for fine-tuning.
+
+    Supports:
+      - HuggingFace dataset names
+      - Local .json / .jsonl files  (Alpaca-style)
+      - Local .parquet files        (recommended for large datasets)
+      - Local .csv files
+
+    When the loaded tokenizer has a chat_template (e.g. Gemma-4, Llama-3),
+    samples are formatted using apply_chat_template for proper turn markers.
+    Falls back to the classic ### Instruction / ### Response format otherwise.
+    """
+
     def __init__(self, tokenizer, max_length: int = 2048):
-        self.tokenizer = tokenizer
+        self.tokenizer  = tokenizer
         self.max_length = max_length
-        
-        # Ensure pad token exists
+
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-    
+
+    # ------------------------------------------------------------------
+    # Public: instruction / Q-A datasets
+    # ------------------------------------------------------------------
+
     def prepare_instruction_dataset(
         self,
-        dataset_name: str,
+        dataset_path: str,
         split: str = "train",
         instruction_col: str = "instruction",
         input_col: str = "input",
         output_col: str = "output",
-        num_samples: Optional[int] = None
+        question_col: Optional[str] = None,   # alias for instruction_col
+        answer_col:   Optional[str] = None,   # alias for output_col
+        num_samples: Optional[int] = None,
+        tokenize: bool = True,
     ) -> Dataset:
         """
-        Prepare an instruction-following dataset.
-        
-        Supports common formats:
-        - Alpaca-style: instruction, input, output
-        - ShareGPT-style: conversations
-        - Custom: specify column names
+        Load and format an instruction / Q-A dataset.
+
+        Args:
+            dataset_path : HuggingFace name, or path to .json/.jsonl/.parquet/.csv
+            question_col : column name for questions  (overrides instruction_col)
+            answer_col   : column name for answers    (overrides output_col)
+            tokenize     : If False, returns dataset with a 'text' column only.
+                           Set False when using SFTTrainer (handles tokenisation
+                           internally and adds sequence packing).
         """
-        logger.info(f"Loading dataset: {dataset_name}")
-        
-        # Load dataset
-        if dataset_name.endswith(".json") or dataset_name.endswith(".jsonl"):
-            dataset = load_dataset("json", data_files=dataset_name, split="train")
-        else:
-            dataset = load_dataset(dataset_name, split=split)
-        
+        q_col = question_col or instruction_col
+        a_col = answer_col   or output_col
+
+        logger.info(f"Loading dataset: {dataset_path}")
+        dataset = self._load_raw_dataset(dataset_path, split)
+
         if num_samples:
             dataset = dataset.select(range(min(num_samples, len(dataset))))
-        
-        logger.info(f"Dataset size: {len(dataset)} samples")
-        
-        # Format into instruction template
-        def format_instruction(example):
-            instruction = example.get(instruction_col, "")
-            inp = example.get(input_col, "")
-            output = example.get(output_col, "")
-            
-            if inp:
-                text = f"### Instruction:\n{instruction}\n\n### Input:\n{inp}\n\n### Response:\n{output}"
-            else:
-                text = f"### Instruction:\n{instruction}\n\n### Response:\n{output}"
-            
+        logger.info(f"Dataset size: {len(dataset):,} samples")
+
+        def format_sample(example):
+            question = example.get(q_col) or example.get(instruction_col, "")
+            answer   = example.get(a_col) or example.get(output_col, "")
+            extra    = example.get(input_col, "")
+
+            text = self._apply_template(question, answer, extra)
             return {"text": text}
-        
-        dataset = dataset.map(format_instruction, remove_columns=dataset.column_names)
-        return self._tokenize_dataset(dataset)
-    
+
+        dataset = dataset.map(format_sample, remove_columns=dataset.column_names)
+
+        if tokenize:
+            return self._tokenize_dataset(dataset)
+        return dataset   # raw 'text' column for SFTTrainer
+
     def prepare_conversational_dataset(
         self,
         dataset_name: str,
         split: str = "train",
         conversations_col: str = "conversations",
-        num_samples: Optional[int] = None
+        num_samples: Optional[int] = None,
     ) -> Dataset:
-        """Prepare a conversational/chat dataset."""
+        """Prepare a conversational/ShareGPT-style dataset."""
         logger.info(f"Loading conversational dataset: {dataset_name}")
-        
         dataset = load_dataset(dataset_name, split=split)
-        
+
         if num_samples:
             dataset = dataset.select(range(min(num_samples, len(dataset))))
-        
+
         def format_conversation(example):
-            conversations = example.get(conversations_col, [])
-            text_parts = []
-            
-            for msg in conversations:
-                role = msg.get("role", msg.get("from", "user"))
+            parts = []
+            for msg in example.get(conversations_col, []):
+                role    = msg.get("role", msg.get("from", "user"))
                 content = msg.get("content", msg.get("value", ""))
-                
-                if role in ["user", "human"]:
-                    text_parts.append(f"### User:\n{content}")
-                else:
-                    text_parts.append(f"### Assistant:\n{content}")
-            
-            return {"text": "\n\n".join(text_parts)}
-        
+                tag     = "### User" if role in ("user", "human") else "### Assistant"
+                parts.append(f"{tag}:\n{content}")
+            return {"text": "\n\n".join(parts)}
+
         dataset = dataset.map(format_conversation, remove_columns=dataset.column_names)
         return self._tokenize_dataset(dataset)
-    
-    def prepare_custom_dataset(self, data: List[Dict[str, str]]) -> Dataset:
-        """Prepare a custom dataset from a list of text examples."""
-        dataset = Dataset.from_list([{"text": item["text"]} for item in data])
-        return self._tokenize_dataset(dataset)
-    
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load_raw_dataset(self, dataset_path: str, split: str) -> Dataset:
+        """Detect format and load dataset."""
+        if dataset_path.endswith(".parquet"):
+            return load_dataset("parquet", data_files=dataset_path, split="train")
+        if dataset_path.endswith(".json") or dataset_path.endswith(".jsonl"):
+            return load_dataset("json",    data_files=dataset_path, split="train")
+        if dataset_path.endswith(".csv"):
+            return load_dataset("csv",     data_files=dataset_path, split="train")
+        # HuggingFace hub name
+        return load_dataset(dataset_path, split=split)
+
+    def _apply_template(self, question: str, answer: str, extra: str = "") -> str:
+        """Format a Q/A pair using the tokenizer's chat template if available."""
+        if getattr(self.tokenizer, "chat_template", None):
+            user_content = f"{question}\n\n{extra}".strip() if extra else question
+            # Gemma-4 and newer Gemma models use "model" role for the assistant.
+            # Other models (Llama-3, Mistral, etc.) use "assistant".
+            assistant_role = (
+                "model"
+                if "gemma" in (self.tokenizer.name_or_path or "").lower()
+                else "assistant"
+            )
+            messages = [
+                {"role": "user",          "content": user_content},
+                {"role": assistant_role,  "content": answer},
+            ]
+            return self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+
+        # Fallback: classic Alpaca-style markers
+        if extra:
+            return (
+                f"### Instruction:\n{question}\n\n"
+                f"### Input:\n{extra}\n\n"
+                f"### Response:\n{answer}"
+            )
+        return f"### Instruction:\n{question}\n\n### Response:\n{answer}"
+
     def _tokenize_dataset(self, dataset: Dataset) -> Dataset:
-        """Tokenize the dataset for training."""
-        def tokenize_function(examples):
-            tokenized = self.tokenizer(
+        def tokenize_fn(examples):
+            tok = self.tokenizer(
                 examples["text"],
                 truncation=True,
                 max_length=self.max_length,
                 padding="max_length",
                 return_tensors=None,
             )
-            tokenized["labels"] = tokenized["input_ids"].copy()
-            return tokenized
-        
+            tok["labels"] = tok["input_ids"].copy()
+            return tok
+
         return dataset.map(
-            tokenize_function,
+            tokenize_fn,
             batched=True,
             remove_columns=["text"],
-            desc="Tokenizing dataset"
+            desc="Tokenising",
         )
 
 
@@ -270,166 +367,245 @@ class DatasetPreparator:
 class FineTuner:
     """
     Fine-tuning orchestrator for DGX Spark.
-    
-    Supports:
-    - Full fine-tuning (best quality, highest memory)
-    - LoRA (good quality, moderate memory)
-    - QLoRA (good quality, lowest memory)
+
+    Primary path   : QLoRA + SFTTrainer with packing  (recommended for ≥13B)
+    Secondary path : LoRA / Full + standard Trainer   (smaller models)
     """
-    
+
     def __init__(
         self,
         model_name: str,
-        method: str = "lora",
+        method: str = "qlora",
         output_dir: str = "./output",
-        use_flash_attention: bool = True
+        use_flash_attention: bool = True,
     ):
-        self.model_name = self._resolve_model_name(model_name)
-        self.method = method.lower()
-        self.output_dir = Path(output_dir)
+        self.model_name        = self._resolve_model_name(model_name)
+        self.method            = method.lower()
+        self.output_dir        = Path(output_dir)
         self.use_flash_attention = use_flash_attention
-        
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize components
+
         self.tokenizer = None
-        self.model = None
-        self.trainer = None
-        
-        logger.info(f"Initializing FineTuner")
-        logger.info(f"  Model: {self.model_name}")
-        logger.info(f"  Method: {self.method}")
-        logger.info(f"  Output: {self.output_dir}")
-    
+        self.model     = None
+        self.trainer   = None
+
+        logger.info("Initialising FineTuner")
+        logger.info(f"  Model  : {self.model_name}")
+        logger.info(f"  Method : {self.method}")
+        logger.info(f"  Output : {self.output_dir}")
+
     def _resolve_model_name(self, name: str) -> str:
-        """Resolve model shorthand to full HuggingFace path."""
         return SUPPORTED_MODELS.get(name.lower(), name)
-    
+
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
+
     def load_model_and_tokenizer(self):
-        """Load model and tokenizer with appropriate configuration."""
-        logger.info("Loading tokenizer...")
+        logger.info("Loading tokeniser …")
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name,
-            trust_remote_code=True,
+            self.model_name, trust_remote_code=True
         )
-        
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        logger.info(f"Loading model with method: {self.method}")
-        
-        # Common model kwargs
-        model_kwargs = {
-            "trust_remote_code": True,
-            "device_map": "auto",
-        }
-        
-        # Enable Flash Attention 2 if available
+
+        logger.info(f"Loading model [{self.method}] …")
+        model_kwargs = {"trust_remote_code": True, "device_map": "auto"}
+
         if self.use_flash_attention:
-            try:
-                model_kwargs["attn_implementation"] = "flash_attention_2"
-                logger.info("Using Flash Attention 2")
-            except Exception as e:
-                logger.warning(f"Flash Attention not available: {e}")
-        
-        if self.method == "full":
-            self._load_full_precision_model(model_kwargs)
-        elif self.method == "lora":
-            self._load_lora_model(model_kwargs)
-        elif self.method == "qlora":
-            self._load_qlora_model(model_kwargs)
-        else:
-            raise ValueError(f"Unknown method: {self.method}")
-        
-        # Log memory usage
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+            logger.info("Flash Attention 2 enabled")
+
+        dispatch = {
+            "full":  self._load_full_precision_model,
+            "lora":  self._load_lora_model,
+            "qlora": self._load_qlora_model,
+        }
+        if self.method not in dispatch:
+            raise ValueError(f"Unknown method '{self.method}'. Choose: full, lora, qlora")
+
+        dispatch[self.method](model_kwargs)
         self._log_memory_usage()
-    
+
     def _load_full_precision_model(self, model_kwargs: Dict):
-        """Load model for full fine-tuning."""
         model_kwargs["torch_dtype"] = torch.bfloat16
-        
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            **model_kwargs
-        )
-        
-        # Enable gradient checkpointing to save memory
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
         self.model.gradient_checkpointing_enable()
-        logger.info("Loaded model for full fine-tuning with gradient checkpointing")
-    
+        logger.info("Loaded model for full fine-tuning (BF16 + gradient checkpointing)")
+
     def _load_lora_model(self, model_kwargs: Dict):
-        """Load model with LoRA adapters."""
         model_kwargs["torch_dtype"] = torch.bfloat16
-        
-        base_model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            **model_kwargs
-        )
-        
-        # LoRA configuration optimized for instruction-following
-        lora_config = LoraConfig(
+        base = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
+        lora_cfg = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
-            r=16,                          # LoRA rank
-            lora_alpha=32,                 # Alpha scaling factor
-            lora_dropout=0.05,             # Dropout for regularization
-            target_modules=[               # Target attention layers
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj"
-            ],
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
             bias="none",
         )
-        
-        self.model = get_peft_model(base_model, lora_config)
+        self.model = get_peft_model(base, lora_cfg)
         self.model.print_trainable_parameters()
         logger.info("Loaded model with LoRA adapters")
-    
+
     def _load_qlora_model(self, model_kwargs: Dict):
-        """Load quantized model with LoRA adapters (QLoRA)."""
-        # 4-bit quantization configuration
-        bnb_config = BitsAndBytesConfig(
+        """
+        QLoRA for large models (13B+).
+
+        Weights loaded in NF4 4-bit (bitsandbytes), compute in BF16.
+        LoRA rank 32 is chosen to balance capacity and memory for a 31B model.
+        Double quantisation reduces the quantisation constant memory footprint.
+        """
+        bnb_cfg = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",           # NormalFloat4 quantization
+            bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,      # Nested quantization
+            bnb_4bit_use_double_quant=True,
         )
-        
-        model_kwargs["quantization_config"] = bnb_config
-        
-        base_model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            **model_kwargs
-        )
-        
-        # Prepare for k-bit training
-        base_model = prepare_model_for_kbit_training(
-            base_model,
-            use_gradient_checkpointing=True
-        )
-        
-        # QLoRA configuration
-        lora_config = LoraConfig(
+        model_kwargs["quantization_config"] = bnb_cfg
+
+        base = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
+        base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=True)
+
+        # r=32 for 31B: provides enough capacity for domain adaptation without
+        # over-fitting or excessive memory. alpha=64 keeps effective scale = 2.
+        lora_cfg = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
-            r=64,                          # Higher rank for QLoRA
-            lora_alpha=16,
-            lora_dropout=0.1,
+            r=32,
+            lora_alpha=64,
+            lora_dropout=0.05,
             target_modules=[
                 "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj"
+                "gate_proj", "up_proj", "down_proj",
             ],
             bias="none",
         )
-        
-        self.model = get_peft_model(base_model, lora_config)
+        self.model = get_peft_model(base, lora_cfg)
         self.model.print_trainable_parameters()
-        logger.info("Loaded quantized model with QLoRA adapters")
-    
+        logger.info("Loaded quantised model with QLoRA adapters (NF4 + BF16 compute)")
+
     def _log_memory_usage(self):
-        """Log current GPU memory usage."""
         if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1e9
-            reserved = torch.cuda.memory_reserved() / 1e9
-            logger.info(f"GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
-    
+            alloc   = torch.cuda.memory_allocated()  / 1e9
+            reserved = torch.cuda.memory_reserved()  / 1e9
+            logger.info(f"GPU memory — allocated: {alloc:.2f} GB, reserved: {reserved:.2f} GB")
+
+    # ------------------------------------------------------------------
+    # Training  —  SFTTrainer path (recommended: packing, chat template)
+    # ------------------------------------------------------------------
+
+    def train_sft(
+        self,
+        sft_dataset: Dataset,               # dataset with 'text' column, NOT tokenised
+        eval_dataset: Optional[Dataset] = None,
+        num_epochs: int = 1,
+        learning_rate: Optional[float] = None,
+        batch_size: Optional[int] = None,
+        gradient_accumulation_steps: Optional[int] = None,
+        max_seq_length: int = 2048,
+        warmup_ratio: float = 0.03,
+        save_steps: int = 500,
+        logging_steps: int = 25,
+        max_grad_norm: float = 1.0,
+    ):
+        """
+        Fine-tune using TRL SFTTrainer with sequence packing.
+
+        Packing concatenates multiple short examples into a single sequence
+        up to max_seq_length, eliminating padding waste and improving GPU
+        utilisation by 30-50% for datasets with variable-length samples.
+        """
+        try:
+            from trl import SFTTrainer, SFTConfig
+        except ImportError:
+            raise ImportError(
+                "TRL is required for SFT training. "
+                "Run: pip install 'trl>=0.12.0'"
+            )
+
+        settings = DGXSparkConfig.get_optimal_settings(self.model_name, self.method)
+        batch_size                = batch_size                or settings["batch_size"]
+        gradient_accumulation_steps = gradient_accumulation_steps or settings["gradient_accumulation"]
+        learning_rate             = learning_rate             or settings["learning_rate"]
+
+        effective_batch = batch_size * gradient_accumulation_steps
+        logger.info("SFT Training configuration:")
+        logger.info(f"  Epochs              : {num_epochs}")
+        logger.info(f"  Per-device batch    : {batch_size}")
+        logger.info(f"  Gradient accum      : {gradient_accumulation_steps}")
+        logger.info(f"  Effective batch     : {effective_batch}")
+        logger.info(f"  Learning rate       : {learning_rate}")
+        logger.info(f"  Max sequence length : {max_seq_length}")
+        logger.info(f"  Packing             : enabled")
+
+        sft_cfg = SFTConfig(
+            output_dir                  = str(self.output_dir),
+            num_train_epochs            = num_epochs,
+            per_device_train_batch_size = batch_size,
+            per_device_eval_batch_size  = batch_size,
+            gradient_accumulation_steps = gradient_accumulation_steps,
+            learning_rate               = learning_rate,
+            weight_decay                = 0.01,
+            warmup_ratio                = warmup_ratio,
+            lr_scheduler_type           = "cosine",
+            logging_steps               = logging_steps,
+            save_steps                  = save_steps,
+            save_total_limit            = 3,
+            eval_strategy               = "steps" if eval_dataset else "no",
+            eval_steps                  = save_steps if eval_dataset else None,
+            bf16                        = True,
+            tf32                        = True,
+            gradient_checkpointing      = True,
+            max_grad_norm               = max_grad_norm,
+            report_to                   = ["tensorboard"],
+            logging_dir                 = str(self.output_dir / "logs"),
+            dataloader_num_workers      = 4,
+            dataloader_pin_memory       = True,
+            remove_unused_columns       = False,
+            optim                       = "adamw_torch_fused",
+            # SFT-specific ────────────────────────────────────────────
+            max_seq_length              = max_seq_length,
+            packing                     = True,
+            dataset_text_field          = "text",
+        )
+
+        lora_cfg = LoraConfig(
+            task_type      = TaskType.CAUSAL_LM,
+            r              = 32,
+            lora_alpha     = 64,
+            lora_dropout   = 0.05,
+            target_modules = [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+            bias = "none",
+        )
+
+        self.trainer = SFTTrainer(
+            model         = self.model,
+            tokenizer     = self.tokenizer,
+            args          = sft_cfg,
+            train_dataset = sft_dataset,
+            eval_dataset  = eval_dataset,
+            peft_config   = lora_cfg if self.method in ("lora", "qlora") else None,
+            callbacks     = [MemoryMonitorCallback()],
+        )
+
+        logger.info("Starting SFT training …")
+        result = self.trainer.train()
+        self.save_model()
+
+        metrics = result.metrics
+        self.trainer.log_metrics("train", metrics)
+        self.trainer.save_metrics("train", metrics)
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Training  —  standard Trainer path (backward-compatible)
+    # ------------------------------------------------------------------
+
     def train(
         self,
         train_dataset: Dataset,
@@ -443,136 +619,105 @@ class FineTuner:
         logging_steps: int = 10,
         max_grad_norm: float = 1.0,
     ):
-        """
-        Execute fine-tuning training.
-        
-        Args:
-            train_dataset: Tokenized training dataset
-            eval_dataset: Optional evaluation dataset
-            num_epochs: Number of training epochs
-            learning_rate: Learning rate
-            batch_size: Per-device batch size (auto-detected if None)
-            gradient_accumulation_steps: Gradient accumulation (auto-detected if None)
-            warmup_ratio: Warmup ratio for learning rate scheduler
-            save_steps: Save checkpoint every N steps
-            logging_steps: Log metrics every N steps
-            max_grad_norm: Maximum gradient norm for clipping
-        """
-        # Auto-detect optimal settings if not provided
-        if batch_size is None or gradient_accumulation_steps is None:
-            settings = DGXSparkConfig.get_optimal_settings(
-                self.model_name, self.method
-            )
-            batch_size = batch_size or settings["batch_size"]
-            gradient_accumulation_steps = gradient_accumulation_steps or settings["gradient_accumulation"]
-        
-        logger.info(f"Training Configuration:")
-        logger.info(f"  Epochs: {num_epochs}")
-        logger.info(f"  Batch Size: {batch_size}")
-        logger.info(f"  Gradient Accumulation: {gradient_accumulation_steps}")
-        logger.info(f"  Effective Batch Size: {batch_size * gradient_accumulation_steps}")
-        logger.info(f"  Learning Rate: {learning_rate}")
-        
-        # Training arguments optimized for DGX Spark
+        """Standard Trainer path. Accepts a pre-tokenised dataset."""
+        settings = DGXSparkConfig.get_optimal_settings(self.model_name, self.method)
+        batch_size                  = batch_size or settings["batch_size"]
+        gradient_accumulation_steps = gradient_accumulation_steps or settings["gradient_accumulation"]
+
+        logger.info(f"Training — epochs: {num_epochs}, batch: {batch_size}, "
+                    f"accum: {gradient_accumulation_steps}, lr: {learning_rate}")
+
         training_args = TrainingArguments(
-            output_dir=str(self.output_dir),
-            num_train_epochs=num_epochs,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=learning_rate,
-            weight_decay=0.01,
-            warmup_ratio=warmup_ratio,
-            lr_scheduler_type="cosine",
-            logging_steps=logging_steps,
-            save_steps=save_steps,
-            save_total_limit=3,
-            eval_strategy="steps" if eval_dataset else "no",
-            eval_steps=save_steps if eval_dataset else None,
-            bf16=True,                          # Use BF16 on DGX Spark
-            tf32=True,                          # Enable TF32 for faster matmuls
-            gradient_checkpointing=True,
-            max_grad_norm=max_grad_norm,
-            report_to=["tensorboard"],
-            logging_dir=str(self.output_dir / "logs"),
-            dataloader_num_workers=4,
-            dataloader_pin_memory=True,
-            remove_unused_columns=False,
-            optim="adamw_torch_fused",          # Fused optimizer for speed
+            output_dir                  = str(self.output_dir),
+            num_train_epochs            = num_epochs,
+            per_device_train_batch_size = batch_size,
+            per_device_eval_batch_size  = batch_size,
+            gradient_accumulation_steps = gradient_accumulation_steps,
+            learning_rate               = learning_rate,
+            weight_decay                = 0.01,
+            warmup_ratio                = warmup_ratio,
+            lr_scheduler_type           = "cosine",
+            logging_steps               = logging_steps,
+            save_steps                  = save_steps,
+            save_total_limit            = 3,
+            eval_strategy               = "steps" if eval_dataset else "no",
+            eval_steps                  = save_steps if eval_dataset else None,
+            bf16                        = True,
+            tf32                        = True,
+            gradient_checkpointing      = True,
+            max_grad_norm               = max_grad_norm,
+            report_to                   = ["tensorboard"],
+            logging_dir                 = str(self.output_dir / "logs"),
+            dataloader_num_workers      = 4,
+            dataloader_pin_memory       = True,
+            remove_unused_columns       = False,
+            optim                       = "adamw_torch_fused",
         )
-        
-        # Data collator for causal LM
-        data_collator = DataCollatorForLanguageModeling(
-            tokenizer=self.tokenizer,
-            mlm=False,
-        )
-        
-        # Initialize trainer
+
+        collator = DataCollatorForLanguageModeling(self.tokenizer, mlm=False)
+
         self.trainer = Trainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            data_collator=data_collator,
-            callbacks=[MemoryMonitorCallback()],
+            model         = self.model,
+            args          = training_args,
+            train_dataset = train_dataset,
+            eval_dataset  = eval_dataset,
+            data_collator = collator,
+            callbacks     = [MemoryMonitorCallback()],
         )
-        
-        # Start training
-        logger.info("Starting training...")
-        train_result = self.trainer.train()
-        
-        # Save final model
+
+        logger.info("Starting training …")
+        result = self.trainer.train()
         self.save_model()
-        
-        # Log training metrics
-        metrics = train_result.metrics
+
+        metrics = result.metrics
         self.trainer.log_metrics("train", metrics)
         self.trainer.save_metrics("train", metrics)
-        
         return metrics
-    
+
+    # ------------------------------------------------------------------
+    # Saving
+    # ------------------------------------------------------------------
+
     def save_model(self, path: Optional[str] = None):
-        """Save the fine-tuned model."""
         save_path = Path(path) if path else self.output_dir / "final_model"
         save_path.mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"Saving model to {save_path}")
-        
-        if self.method in ["lora", "qlora"]:
-            # Save LoRA adapters
+        logger.info(f"Saving model to {save_path} …")
+
+        if self.method in ("lora", "qlora"):
             self.model.save_pretrained(save_path)
             self.tokenizer.save_pretrained(save_path)
-            
-            # Also save merged model for inference
+
             merged_path = save_path.parent / "merged_model"
-            logger.info(f"Merging and saving full model to {merged_path}")
-            
-            merged_model = self.model.merge_and_unload()
-            merged_model.save_pretrained(merged_path)
+            logger.info(f"Merging and saving full model to {merged_path} …")
+            merged = self.model.merge_and_unload()
+            merged.save_pretrained(merged_path, safe_serialization=True)
             self.tokenizer.save_pretrained(merged_path)
+            logger.info(f"Merged BF16 model saved to {merged_path}")
+            logger.info(
+                "Next step: run quantize_to_nvfp4.py to convert the merged model "
+                "to NVFP4 for maximum DGX Spark inference performance."
+            )
         else:
             self.model.save_pretrained(save_path)
             self.tokenizer.save_pretrained(save_path)
-        
-        # Save training config
-        config = {
+
+        meta = {
             "model_name": self.model_name,
-            "method": self.method,
-            "timestamp": datetime.now().isoformat(),
+            "method":     self.method,
+            "timestamp":  datetime.now().isoformat(),
         }
         with open(save_path / "training_config.json", "w") as f:
-            json.dump(config, f, indent=2)
-        
-        logger.info("Model saved successfully")
+            json.dump(meta, f, indent=2)
+
+        logger.info("Model saved successfully.")
 
 
 class MemoryMonitorCallback(TrainerCallback):
-    """Callback to monitor GPU memory during training."""
-    
+    """Log GPU memory every 50 steps."""
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step % 50 == 0 and torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1e9
-            logger.debug(f"Step {state.global_step}: GPU Memory = {allocated:.2f} GB")
+            alloc = torch.cuda.memory_allocated() / 1e9
+            logger.debug(f"Step {state.global_step}: GPU mem = {alloc:.2f} GB")
 
 
 # =============================================================================
@@ -580,32 +725,22 @@ class MemoryMonitorCallback(TrainerCallback):
 # =============================================================================
 
 class InferenceEngine:
-    """Run inference with fine-tuned models."""
-    
+    """Run inference with a fine-tuned (or base) model."""
+
     def __init__(self, model_path: str, use_flash_attention: bool = True):
-        self.model_path = Path(model_path)
-        
-        logger.info(f"Loading model from {model_path}")
-        
+        logger.info(f"Loading model from {model_path} …")
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        
-        model_kwargs = {
-            "torch_dtype": torch.bfloat16,
-            "device_map": "auto",
+        kwargs = {
+            "torch_dtype":    torch.bfloat16,
+            "device_map":     "auto",
             "trust_remote_code": True,
         }
-        
         if use_flash_attention:
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-        
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            **model_kwargs
-        )
-        
+            kwargs["attn_implementation"] = "flash_attention_2"
+        self.model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
         self.model.eval()
-        logger.info("Model loaded for inference")
-    
+        logger.info("Model loaded for inference.")
+
     def generate(
         self,
         prompt: str,
@@ -614,39 +749,41 @@ class InferenceEngine:
         top_p: float = 0.9,
         do_sample: bool = True,
     ) -> str:
-        """Generate text from a prompt."""
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=do_sample,
-                pad_token_id=self.tokenizer.pad_token_id,
+                max_new_tokens  = max_new_tokens,
+                temperature     = temperature,
+                top_p           = top_p,
+                do_sample       = do_sample,
+                pad_token_id    = self.tokenizer.pad_token_id,
             )
-        
         response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Remove the input prompt from response
         if response.startswith(prompt):
             response = response[len(prompt):].strip()
-        
         return response
-    
-    def chat(self, instruction: str, context: str = "") -> str:
-        """Generate a response to an instruction."""
-        if context:
-            prompt = f"### Instruction:\n{instruction}\n\n### Input:\n{context}\n\n### Response:\n"
+
+    def chat(self, question: str, context: str = "") -> str:
+        if getattr(self.tokenizer, "chat_template", None):
+            content = f"{question}\n\n{context}".strip() if context else question
+            assistant_role = (
+                "model" if "gemma" in (self.tokenizer.name_or_path or "").lower()
+                else "assistant"
+            )
+            messages = [{"role": "user", "content": content}]
+            prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        elif context:
+            prompt = f"### Instruction:\n{question}\n\n### Input:\n{context}\n\n### Response:\n"
         else:
-            prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
-        
+            prompt = f"### Instruction:\n{question}\n\n### Response:\n"
         return self.generate(prompt)
 
 
 # =============================================================================
-# CLI INTERFACE
+# CLI
 # =============================================================================
 
 def main():
@@ -654,141 +791,166 @@ def main():
         description="Fine-tune language models on NVIDIA DGX Spark",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Fine-tune Llama 3.2 1B with LoRA
-  python finetune_dgx_spark.py --model llama-3.2-1b --method lora --dataset alpaca
+Medical fine-tuning example (Gemma-4-31B, QLoRA, SFTTrainer):
+  export HF_TOKEN=<your_token>
+  python finetune_dgx_spark.py \\
+      --model gemma-4-31b \\
+      --method qlora \\
+      --dataset /home/ubuntu/medAI/medical_train.parquet \\
+      --question-col question \\
+      --answer-col answer \\
+      --epochs 1 \\
+      --output-dir output/gemma4_medical
 
-  # Fine-tune Qwen 2.5 3B with QLoRA
-  python finetune_dgx_spark.py --model qwen2.5-3b --method qlora --dataset tatsu-lab/alpaca
+Classic LoRA example:
+  python finetune_dgx_spark.py --model qwen2.5-3b --method lora --dataset data.json
 
-  # Full fine-tuning of SmolLM (small model)
-  python finetune_dgx_spark.py --model smollm-360m --method full --dataset your_data.json
-
-Supported models:
-  llama-3.2-1b, llama-3.2-3b, llama-3.1-8b
-  mistral-7b, mistral-nemo-12b
-  qwen2.5-1.5b, qwen2.5-3b, qwen2.5-7b
-  phi-3-mini, phi-3-small
-  gemma-2-2b, gemma-2-9b
-  smollm-135m, smollm-360m, smollm-1.7b
-        """
+Inference:
+  python finetune_dgx_spark.py \\
+      --inference \\
+      --model-path output/gemma4_medical/merged_model \\
+      --prompt "What are the symptoms of type-2 diabetes?"
+        """,
     )
-    
-    # Model configuration
-    parser.add_argument("--model", type=str, required=True,
-                       help="Model name (shorthand or HuggingFace path)")
-    parser.add_argument("--method", type=str, default="lora",
-                       choices=["full", "lora", "qlora"],
-                       help="Fine-tuning method")
-    
-    # Dataset configuration
-    parser.add_argument("--dataset", type=str, required=True,
-                       help="Dataset name (HuggingFace or local JSON file)")
-    parser.add_argument("--dataset-format", type=str, default="instruction",
-                       choices=["instruction", "conversation", "text"],
-                       help="Dataset format type")
-    parser.add_argument("--max-samples", type=int, default=None,
-                       help="Maximum number of training samples")
-    parser.add_argument("--max-length", type=int, default=2048,
-                       help="Maximum sequence length")
-    
-    # Training configuration
-    parser.add_argument("--epochs", type=int, default=3,
-                       help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=None,
-                       help="Batch size (auto-detected if not set)")
-    parser.add_argument("--learning-rate", type=float, default=2e-4,
-                       help="Learning rate")
-    parser.add_argument("--output-dir", type=str, default="./output",
-                       help="Output directory for model and logs")
-    
-    # Hardware options
+
+    # ── Model ────────────────────────────────────────────────────────────────
+    parser.add_argument("--model",  required=True,
+                        help="Model shorthand (e.g. gemma-4-31b) or HuggingFace path")
+    parser.add_argument("--method", default="qlora",
+                        choices=["full", "lora", "qlora"],
+                        help="Fine-tuning method (default: qlora)")
+
+    # ── Dataset ──────────────────────────────────────────────────────────────
+    parser.add_argument("--dataset",       required=True,
+                        help="Path to .parquet / .json / .jsonl / .csv, or HF dataset name")
+    parser.add_argument("--question-col",  default=None,
+                        help="Column name for questions (default: 'instruction')")
+    parser.add_argument("--answer-col",    default=None,
+                        help="Column name for answers   (default: 'output')")
+    parser.add_argument("--dataset-format", default="instruction",
+                        choices=["instruction", "conversation"],
+                        help="Dataset schema (default: instruction)")
+    parser.add_argument("--max-samples",   type=int, default=None,
+                        help="Cap the number of training samples")
+    parser.add_argument("--max-length",    type=int, default=2048,
+                        help="Maximum sequence length (default: 2048)")
+
+    # ── Training ─────────────────────────────────────────────────────────────
+    parser.add_argument("--epochs",        type=int,   default=1,
+                        help="Training epochs (default: 1 — sufficient for 2.2M samples)")
+    parser.add_argument("--batch-size",    type=int,   default=None,
+                        help="Per-device batch size (auto if omitted)")
+    parser.add_argument("--learning-rate", type=float, default=None,
+                        help="Learning rate (auto-selected per model size if omitted)")
+    parser.add_argument("--output-dir",    default="./output",
+                        help="Output directory")
+    parser.add_argument("--no-sft-trainer", action="store_true",
+                        help="Use standard Trainer instead of SFTTrainer (disables packing)")
     parser.add_argument("--no-flash-attention", action="store_true",
-                       help="Disable Flash Attention 2")
-    
-    # Inference mode
-    parser.add_argument("--inference", action="store_true",
-                       help="Run in inference mode (requires --model-path)")
+                        help="Disable Flash Attention 2")
+
+    # ── Inference ────────────────────────────────────────────────────────────
+    parser.add_argument("--inference",  action="store_true",
+                        help="Run inference instead of training")
     parser.add_argument("--model-path", type=str,
-                       help="Path to fine-tuned model for inference")
-    parser.add_argument("--prompt", type=str,
-                       help="Prompt for inference mode")
-    
+                        help="Path to fine-tuned model for inference")
+    parser.add_argument("--prompt",     type=str,
+                        help="Prompt for inference mode")
+
     args = parser.parse_args()
-    
-    # Inference mode
+
+    # ── Inference mode ───────────────────────────────────────────────────────
     if args.inference:
         if not args.model_path:
-            parser.error("--model-path required for inference mode")
-        
-        engine = InferenceEngine(
-            args.model_path,
-            use_flash_attention=not args.no_flash_attention
-        )
-        
+            parser.error("--model-path required for --inference")
+        engine = InferenceEngine(args.model_path,
+                                 use_flash_attention=not args.no_flash_attention)
         if args.prompt:
-            response = engine.chat(args.prompt)
-            print(f"\nResponse:\n{response}")
+            print(f"\nResponse:\n{engine.chat(args.prompt)}")
         else:
-            # Interactive mode
             print("\nInteractive mode (type 'quit' to exit)")
             while True:
-                prompt = input("\nYou: ").strip()
-                if prompt.lower() == 'quit':
+                q = input("\nYou: ").strip()
+                if q.lower() == "quit":
                     break
-                response = engine.chat(prompt)
-                print(f"\nAssistant: {response}")
-        
+                print(f"\nAssistant: {engine.chat(q)}")
         return
-    
-    # Training mode
+
+    # ── Training mode ────────────────────────────────────────────────────────
     print("=" * 60)
     print("DGX Spark Fine-Tuning")
     print("=" * 60)
-    
-    # Initialize fine-tuner
+
+    use_sft = not args.no_sft_trainer
+
     finetuner = FineTuner(
-        model_name=args.model,
-        method=args.method,
-        output_dir=args.output_dir,
-        use_flash_attention=not args.no_flash_attention
+        model_name        = args.model,
+        method            = args.method,
+        output_dir        = args.output_dir,
+        use_flash_attention = not args.no_flash_attention,
     )
-    
-    # Load model
     finetuner.load_model_and_tokenizer()
-    
-    # Prepare dataset
-    preparator = DatasetPreparator(
-        finetuner.tokenizer,
-        max_length=args.max_length
-    )
-    
+
+    preparator = DatasetPreparator(finetuner.tokenizer, max_length=args.max_length)
+
     if args.dataset_format == "instruction":
-        train_dataset = preparator.prepare_instruction_dataset(
+        dataset = preparator.prepare_instruction_dataset(
             args.dataset,
-            num_samples=args.max_samples
+            question_col = args.question_col,
+            answer_col   = args.answer_col,
+            num_samples  = args.max_samples,
+            tokenize     = not use_sft,   # SFTTrainer does its own tokenisation
         )
     elif args.dataset_format == "conversation":
-        train_dataset = preparator.prepare_conversational_dataset(
-            args.dataset,
-            num_samples=args.max_samples
+        dataset = preparator.prepare_conversational_dataset(
+            args.dataset, num_samples=args.max_samples
         )
     else:
-        raise ValueError(f"Unsupported dataset format: {args.dataset_format}")
-    
-    # Train
-    metrics = finetuner.train(
-        train_dataset=train_dataset,
-        num_epochs=args.epochs,
-        learning_rate=args.learning_rate,
-        batch_size=args.batch_size,
-    )
-    
+        raise ValueError(f"Unknown dataset-format: {args.dataset_format}")
+
+    # Print training time estimate for large jobs
+    if len(dataset) > 10_000:
+        est = DGXSparkConfig.estimate_training_time(
+            num_samples           = len(dataset),
+            avg_tokens_per_sample = 1200,
+            num_epochs            = args.epochs,
+            use_packing           = use_sft,
+        )
+        print(f"\nTraining time estimate (DGX Spark GB10):")
+        print(f"  Samples          : {len(dataset):,}")
+        print(f"  Epochs           : {args.epochs}")
+        print(f"  Total tokens     : {est['total_tokens']:,}")
+        print(f"  Throughput est.  : {est['tokens_per_sec']:,} tokens/sec")
+        print(f"  Estimated time   : {est['hours']:.1f} h  (~{est['days']:.1f} days)")
+        print()
+
+    if use_sft:
+        metrics = finetuner.train_sft(
+            sft_dataset    = dataset,
+            num_epochs     = args.epochs,
+            learning_rate  = args.learning_rate,
+            batch_size     = args.batch_size,
+            max_seq_length = args.max_length,
+        )
+    else:
+        metrics = finetuner.train(
+            train_dataset  = dataset,
+            num_epochs     = args.epochs,
+            learning_rate  = args.learning_rate or 2e-4,
+            batch_size     = args.batch_size,
+        )
+
     print("\n" + "=" * 60)
-    print("Training Complete!")
+    print("Training complete!")
     print("=" * 60)
-    print(f"Model saved to: {args.output_dir}")
-    print(f"Training loss: {metrics.get('train_loss', 'N/A'):.4f}")
+    print(f"Model saved to  : {args.output_dir}")
+    print(f"Training loss   : {metrics.get('train_loss', 'N/A')}")
+    print()
+    print("Next step — convert merged model to NVFP4 for DGX Spark deployment:")
+    print(f"  python quantize_to_nvfp4.py \\")
+    print(f"      --model-path {args.output_dir}/final_model/merged_model \\")
+    print(f"      --output-path {args.output_dir}/gemma4_medical_nvfp4 \\")
+    print(f"      --calibration-data {args.dataset}")
 
 
 if __name__ == "__main__":
