@@ -37,6 +37,17 @@ from transformers import (
     BitsAndBytesConfig,
     TrainerCallback,
 )
+try:
+    # Text-only CausalLM class for Gemma-4.
+    # AutoModelForCausalLM maps model_type="gemma4" → Gemma4ForConditionalGeneration
+    # (the multimodal VLM).  That model requires mm_token_type_ids during training
+    # and uses a custom loss path that disconnects gradients when TRL's padding_free
+    # mode is active (i.e. packing + no flash_attn).
+    # Gemma4ForCausalLM uses Gemma4TextModel: a plain causal decoder with standard
+    # attention masks and a standard loss — no multimodal plumbing, no gradient issues.
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM as _Gemma4ForCausalLM
+except ImportError:
+    _Gemma4ForCausalLM = None
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -54,6 +65,14 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+# ── GB10 Blackwell performance: enable TF32 + cuDNN benchmark ───────────────
+# These are safe global settings; no GPU ops have run yet at import time.
+# TF32: uses tensor cores for matmul/conv while keeping BF16 range → free speedup.
+# cudnn.benchmark: lets cuDNN pick the fastest algorithm for each kernel shape.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32       = True
+torch.backends.cudnn.benchmark        = True
 
 
 # =============================================================================
@@ -79,12 +98,12 @@ class DGXSparkConfig:
         "3B":  {"full":  8, "lora": 16, "qlora": 32},
         "7B":  {"full":  4, "lora":  8, "qlora": 16},
         "13B": {"full":  2, "lora":  4, "qlora":  8},
-        "30B": {"full":  1, "lora":  2, "qlora":  2},   # Gemma-4-31B lives here
+        "30B": {"full":  1, "lora":  1, "qlora":  1},   # Gemma-4-31B: batch=1 (safe with torch.compile+grad-ckpt)
         "70B": {"full":  1, "lora":  1, "qlora":  2},
     }
 
     GRADIENT_ACCUMULATION = {
-        "1B": 1, "3B": 2, "7B": 4, "13B": 8, "30B": 8, "70B": 16,
+        "1B": 1, "3B": 2, "7B": 4, "13B": 8, "30B": 32, "70B": 16,
     }
 
     # Optimal learning rates per size & method
@@ -410,12 +429,49 @@ class FineTuner:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # Detect Gemma-4 once so all _load_* methods can branch on self._is_gemma4.
+        self._is_gemma4 = False
+        try:
+            from transformers import AutoConfig
+            _cfg = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+            if getattr(_cfg, "model_type", "") == "gemma4":
+                self._is_gemma4 = True
+        except Exception:
+            pass
+
+        # Gemma-4 wraps its linear layers in Gemma4ClippableLinear, which is
+        # not a subclass of torch.nn.Linear and is therefore incompatible with
+        # bitsandbytes + PEFT adapter injection (QLoRA).
+        # With 128 GB unified memory, BF16 LoRA fits comfortably (~86 GB), so
+        # we automatically downgrade qlora → lora for Gemma-4.
+        if self.method == "qlora" and self._is_gemma4:
+            logger.warning(
+                "Gemma-4 detected: Gemma4ClippableLinear is incompatible with "
+                "bitsandbytes PEFT injection (QLoRA). "
+                "Switching to BF16 LoRA — 128 GB unified memory is sufficient "
+                "(model ~62 GB + LoRA + optimizer + activations ≈ 86 GB)."
+            )
+            self.method = "lora"
+
         logger.info(f"Loading model [{self.method}] …")
         model_kwargs = {"trust_remote_code": True, "device_map": "auto"}
 
-        if self.use_flash_attention:
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-            logger.info("Flash Attention 2 enabled")
+        # Always use PyTorch SDPA for Gemma-4 (and as default for all models).
+        # SDPA dispatches to cuDNN's Blackwell-native FlashAttention kernel on
+        # CUDA 13 / GB10 (SM 12.1) — same backend that nanochat uses via
+        # F.scaled_dot_product_attention, which achieved 1,600 tok/sec on this GPU.
+        # flash_attn wheel can't be imported (CUDA 13 ABI mismatch), but SDPA
+        # does not require the flash_attn package — it's built into PyTorch.
+        model_kwargs["attn_implementation"] = "sdpa"
+        logger.info("Attention: PyTorch SDPA (cuDNN Blackwell-native FlashAttention)")
+
+        if self._is_gemma4:
+            logger.info(
+                "Gemma-4 model detected — will load Gemma4ForCausalLM (text-only class) "
+                "instead of AutoModelForCausalLM which defaults to Gemma4ForConditionalGeneration "
+                "(the VLM). The text-only class has a standard causal-LM forward pass with "
+                "no multimodal branches, so gradients flow correctly through LoRA layers."
+            )
 
         dispatch = {
             "full":  self._load_full_precision_model,
@@ -428,22 +484,60 @@ class FineTuner:
         dispatch[self.method](model_kwargs)
         self._log_memory_usage()
 
+    def _model_cls(self):
+        """Return the right from_pretrained class: Gemma4ForCausalLM or AutoModelForCausalLM."""
+        if self._is_gemma4 and _Gemma4ForCausalLM is not None:
+            return _Gemma4ForCausalLM
+        return AutoModelForCausalLM
+
     def _load_full_precision_model(self, model_kwargs: Dict):
-        model_kwargs["torch_dtype"] = torch.bfloat16
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
-        self.model.gradient_checkpointing_enable()
-        logger.info("Loaded model for full fine-tuning (BF16 + gradient checkpointing)")
+        model_kwargs["dtype"] = torch.bfloat16
+        self.model = self._model_cls().from_pretrained(self.model_name, **model_kwargs)
+        # gradient_checkpointing disabled at SFTConfig level; no need to enable here
+        logger.info("Loaded model for full fine-tuning (BF16)")
+
+    @staticmethod
+    def _find_lora_target_modules(model) -> List[str]:
+        """
+        Auto-detect LoRA target modules at runtime.
+
+        Gemma-4 wraps attention and MLP projections in Gemma4ClippableLinear,
+        which PEFT cannot inject into directly.  This function detects that
+        pattern and returns paths that target the inner nn.Linear instead
+        (e.g. "q_proj.linear" instead of "q_proj").
+        """
+        standard = ["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"]
+
+        clippable = set()
+        for name, mod in model.named_modules():
+            if type(mod).__name__ == "Gemma4ClippableLinear":
+                leaf = name.rsplit(".", 1)[-1]
+                if leaf in standard:
+                    clippable.add(leaf)
+
+        if clippable:
+            targets = [f"{t}.linear" for t in standard if t in clippable]
+            logger.info(
+                f"Gemma4ClippableLinear detected on {sorted(clippable)}. "
+                f"Targeting inner .linear sub-modules: {targets}"
+            )
+            return targets
+
+        return standard
 
     def _load_lora_model(self, model_kwargs: Dict):
-        model_kwargs["torch_dtype"] = torch.bfloat16
-        base = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
+        model_kwargs["dtype"] = torch.bfloat16
+        base = self._model_cls().from_pretrained(self.model_name, **model_kwargs)
+
+        target_modules = self._find_lora_target_modules(base)
+
         lora_cfg = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
-            r=16,
-            lora_alpha=32,
+            r=32,
+            lora_alpha=64,
             lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
+            target_modules=target_modules,
             bias="none",
         )
         self.model = get_peft_model(base, lora_cfg)
@@ -466,8 +560,8 @@ class FineTuner:
         )
         model_kwargs["quantization_config"] = bnb_cfg
 
-        base = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
-        base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=True)
+        base = self._model_cls().from_pretrained(self.model_name, **model_kwargs)
+        base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=False)
 
         # r=32 for 31B: provides enough capacity for domain adaptation without
         # over-fitting or excessive memory. alpha=64 keeps effective scale = 2.
@@ -505,7 +599,7 @@ class FineTuner:
         batch_size: Optional[int] = None,
         gradient_accumulation_steps: Optional[int] = None,
         max_seq_length: int = 2048,
-        warmup_ratio: float = 0.03,
+        warmup_steps: int = 100,
         save_steps: int = 500,
         logging_steps: int = 25,
         max_grad_norm: float = 1.0,
@@ -548,7 +642,7 @@ class FineTuner:
             gradient_accumulation_steps = gradient_accumulation_steps,
             learning_rate               = learning_rate,
             weight_decay                = 0.01,
-            warmup_ratio                = warmup_ratio,
+            warmup_steps                = warmup_steps,
             lr_scheduler_type           = "cosine",
             logging_steps               = logging_steps,
             save_steps                  = save_steps,
@@ -557,6 +651,11 @@ class FineTuner:
             eval_steps                  = save_steps if eval_dataset else None,
             bf16                        = True,
             tf32                        = True,
+            # gradient_checkpointing re-enabled: torch.compile is disabled for Gemma-4 LoRA
+            # (SM 12.1 autograd incompatibility), so the compile+grad-ckpt recompile cascade
+            # no longer applies. Without grad-ckpt all 60 layers' activations live simultaneously
+            # (~25 GB peak) which combined with the 62 GB BF16 model caused hard system reboots.
+            # With grad-ckpt: ~62 GB model + ~3 GB activations + ~2 GB LoRA/Adam ≈ 67 GB peak.
             gradient_checkpointing      = True,
             max_grad_norm               = max_grad_norm,
             report_to                   = ["tensorboard"],
@@ -566,31 +665,36 @@ class FineTuner:
             remove_unused_columns       = False,
             optim                       = "adamw_torch_fused",
             # SFT-specific ────────────────────────────────────────────
-            max_seq_length              = max_seq_length,
+            max_length                  = max_seq_length,   # TRL 1.0: renamed from max_seq_length
             packing                     = True,
             dataset_text_field          = "text",
         )
 
-        lora_cfg = LoraConfig(
-            task_type      = TaskType.CAUSAL_LM,
-            r              = 32,
-            lora_alpha     = 64,
-            lora_dropout   = 0.05,
-            target_modules = [
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
-            ],
-            bias = "none",
-        )
+        # No mm_token_type_ids patch needed: we load Gemma4ForCausalLM (text-only)
+        # instead of Gemma4ForConditionalGeneration (VLM).  Gemma4ForCausalLM uses
+        # Gemma4TextModel which has a standard causal-LM forward — no multimodal
+        # token-type routing, no custom loss path, no gradient disconnection.
+        #
+        # Previous approach: monkey-patch forward() to inject mm_token_type_ids=zeros.
+        # Problem: Gemma4ForConditionalGeneration's loss code has a non-standard path
+        # that disconnects gradients when TRL padding_free mode is active (packing +
+        # no flash_attn).  Root cause: TRL auto-enables padding_free=True for the
+        # "bfd" packing strategy, which passes position_ids instead of attention_mask.
+        # The VLM's loss computation then returns a constant tensor with no grad_fn.
+        # Fix: use the text-only model class — same weights, clean forward pass.
+        logger.info("Using Gemma4ForCausalLM (text-only) — no mm_token_type_ids patch needed")
 
+        # LoRA adapters are already applied in _load_lora_model / _load_qlora_model
+        # via get_peft_model(). Passing peft_config again to SFTTrainer would
+        # double-apply LoRA (rejected by TRL 1.0+). Always pass None here.
         self.trainer = SFTTrainer(
-            model         = self.model,
-            tokenizer     = self.tokenizer,
-            args          = sft_cfg,
-            train_dataset = sft_dataset,
-            eval_dataset  = eval_dataset,
-            peft_config   = lora_cfg if self.method in ("lora", "qlora") else None,
-            callbacks     = [MemoryMonitorCallback()],
+            model              = self.model,
+            processing_class   = self.tokenizer,   # TRL 1.0: renamed from tokenizer
+            args               = sft_cfg,
+            train_dataset      = sft_dataset,
+            eval_dataset       = eval_dataset,
+            peft_config        = None,
+            callbacks          = [MemoryMonitorCallback()],
         )
 
         logger.info("Starting SFT training …")
@@ -614,7 +718,7 @@ class FineTuner:
         learning_rate: float = 2e-4,
         batch_size: Optional[int] = None,
         gradient_accumulation_steps: Optional[int] = None,
-        warmup_ratio: float = 0.03,
+        warmup_steps: int = 100,
         save_steps: int = 100,
         logging_steps: int = 10,
         max_grad_norm: float = 1.0,
@@ -635,7 +739,7 @@ class FineTuner:
             gradient_accumulation_steps = gradient_accumulation_steps,
             learning_rate               = learning_rate,
             weight_decay                = 0.01,
-            warmup_ratio                = warmup_ratio,
+            warmup_steps                = warmup_steps,
             lr_scheduler_type           = "cosine",
             logging_steps               = logging_steps,
             save_steps                  = save_steps,
@@ -731,12 +835,12 @@ class InferenceEngine:
         logger.info(f"Loading model from {model_path} …")
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         kwargs = {
-            "torch_dtype":    torch.bfloat16,
+            "dtype":          torch.bfloat16,
             "device_map":     "auto",
             "trust_remote_code": True,
         }
         if use_flash_attention:
-            kwargs["attn_implementation"] = "flash_attention_2"
+            kwargs["attn_implementation"] = "sdpa"
         self.model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
         self.model.eval()
         logger.info("Model loaded for inference.")

@@ -31,6 +31,14 @@
 
 set -e
 
+# ─── GB10 Blackwell / SM 12.1 performance env vars ───────────────────────────
+# Triton uses ptxas from CUDA 13.0 to generate native SM 12.1 kernels.
+# Without this, PyTorch falls back to generic paths (~30x slower).
+export TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH=/usr/local/cuda-13.0/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:${LD_LIBRARY_PATH}
+
 # ─── Configurable paths ───────────────────────────────────────────────────────
 VENV_DIR="/home/ubuntu/venv"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

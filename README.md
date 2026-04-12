@@ -1,122 +1,267 @@
 # Fine-Tuning Language Models on NVIDIA DGX Spark
 
-Complete toolkit for fine-tuning open-source language models on the NVIDIA DGX Spark personal AI supercomputer.
+Complete toolkit for fine-tuning open-source language models on the NVIDIA DGX Spark (GB10 Blackwell).
+Primary use-case: LoRA fine-tuning of large models (7B–31B+) on domain-specific medical datasets to
+produce specialist doctor LLMs (PediatricianGemma, OncologyGemma, etc.).
 
-## 🚀 Quick Start
+The trained models are served via vLLM and consumed by the multi-specialist platform at
+`/home/ubuntu/docLlms` — a full-stack multi-agent system with MCP server, Gradio frontend, and
+FastAPI backend designed for future Docker deployment.
 
-```bash
-# 1. Setup environment
-chmod +x setup.sh && ./setup.sh
+## Strategy: Specialist Doctor LLMs
 
-# 2. Activate environment
-source venv/bin/activate
+Rather than fine-tuning on 2.2M random medical records (~7 months), we fine-tune on 50k
+high-quality records per medical specialty (~4 days each). Each run produces one specialist model.
 
-# 3. Run fine-tuning with a preset
-./run_finetune.sh small
-```
+| Model | Dataset | Rows | Status | Est. Finish |
+|-------|---------|------|--------|-------------|
+| PediatricianGemma | `pediatrics_50k.parquet` | 50,000 | **TRAINING** (step ~6/600) | ~Apr 17 2026 |
+| OncologyGemma | to be extracted | 50,000 | Planned | — |
+| CardiologyGemma | to be extracted | 50,000 | Planned | — |
+| NeurologyGemma | to be extracted | 50,000 | Planned | — |
+| ObGynGemma | to be extracted | 50,000 | Planned | — |
 
-## 📋 Contents
+Dataset source: `/home/ubuntu/medAI/medical_train.parquet` (2,187,808 rows, cols: question/answer)
+Specialty extraction script: keyword-density ranking per specialty — see session notes.
 
-```
-finetune-guide/
-├── scripts/
-│   ├── finetune_dgx_spark.py   # Main fine-tuning script
-│   └── prepare_dataset.py       # Dataset preparation utilities
-├── requirements.txt              # Python dependencies
-├── setup.sh                      # Environment setup script
-├── run_finetune.sh              # Quick-start run script
-└── README.md                     # This file
-```
-
-## 🎯 Supported Models
-
-| Model | Parameters | HuggingFace Path |
-|-------|------------|------------------|
-| SmolLM | 135M-1.7B | `HuggingFaceTB/SmolLM-*` |
-| Qwen 2.5 | 1.5B-7B | `Qwen/Qwen2.5-*` |
-| Llama 3.2 | 1B-3B | `meta-llama/Llama-3.2-*` |
-| Llama 3.1 | 8B | `meta-llama/Llama-3.1-8B` |
-| Mistral | 7B-12B | `mistralai/Mistral-*` |
-| Phi-3 | 3.8B-8B | `microsoft/Phi-3-*` |
-| Gemma 2 | 2B-9B | `google/gemma-2-*` |
-
-## 🔧 Fine-Tuning Methods
-
-### Full Fine-Tuning
-Best for small models (<3B). Updates all parameters.
-```bash
-python scripts/finetune_dgx_spark.py --model smollm-360m --method full --dataset data.json
-```
-
-### LoRA (Recommended)
-Best for medium models (3-13B). Trains only adapter layers.
-```bash
-python scripts/finetune_dgx_spark.py --model qwen2.5-3b --method lora --dataset data.json
-```
-
-### QLoRA
-Best for large models (13B+). Uses 4-bit quantization.
-```bash
-python scripts/finetune_dgx_spark.py --model llama-3.1-8b --method qlora --dataset data.json
-```
-
-## 📊 Dataset Format
-
-### Alpaca Format (Recommended)
-```json
-[
-  {
-    "instruction": "Explain machine learning",
-    "input": "",
-    "output": "Machine learning is..."
-  }
-]
-```
-
-### Create Sample Data
-```bash
-python scripts/prepare_dataset.py --create-sample
-```
-
-## ⚡ DGX Spark Advantages
-
-- **128GB Unified Memory**: Train 70B models locally with QLoRA
-- **900 GB/s NVLink-C2C**: Fast CPU-GPU communication
-- **Local Execution**: Complete privacy, no cloud costs
-- **1 PFLOPS Performance**: Enterprise-grade AI capabilities
-
-## 📖 Full Documentation
-
-See `DGX_Spark_Fine_Tuning_Guide.docx` for comprehensive instructions.
-
-## 🔄 Run Presets
+## Quick Start — PediatricianGemma (current run)
 
 ```bash
-./run_finetune.sh quick   # SmolLM 360M, full fine-tuning
-./run_finetune.sh small   # Qwen 3B, LoRA
-./run_finetune.sh medium  # Llama 8B, LoRA  
-./run_finetune.sh large   # Llama 8B, QLoRA
+# 1. Set your HuggingFace token
+export HF_TOKEN=hf_...
+
+# 2. Run the full pipeline (preprocess → train → quantize)
+chmod +x run_medical_finetune.sh
+./run_medical_finetune.sh
+
+# Or skip stages already done:
+SKIP_INSTALL=1 SKIP_PREPROCESS=1 ./run_medical_finetune.sh
 ```
 
-## 📈 Monitoring Training
+## Contents
+
+```
+dgxsparkfinetune/
+├── finetune_dgx_spark.py         # Main fine-tuning script (all models/specialties)
+├── prepare_medical_dataset.py    # Merge 50 medical parquet shards → 1 file
+├── quantize_to_nvfp4.py          # Post-training NVFP4 quantization
+├── run_medical_finetune.sh       # End-to-end pipeline script
+├── monitor_training.sh           # Background monitor → status.log every N seconds
+├── requirements.txt
+└── output/
+    ├── pediatrician_gemma/       # ACTIVE — 50k pediatric Q&A (step ~6/600)
+    ├── oncology_gemma/           # Planned
+    └── cardiology_gemma/         # Planned
+
+/home/ubuntu/medAI/
+├── medical_train.parquet         # Full 2.2M-row dataset
+└── pediatrics_50k.parquet        # Extracted 50k pediatric records (top keyword-density score)
+
+/home/ubuntu/docLlms/             # Serving + multi-agent platform (see that repo)
+```
+
+## Supported Models
+
+| Model | Parameters | Method | Notes |
+|-------|-----------|--------|-------|
+| Gemma-4-31B | 31B | LoRA (BF16) | Primary target. QLoRA auto-downgrades to LoRA — see gotchas. |
+| Llama 3.1/3.2 | 1B–8B | Full / LoRA / QLoRA | |
+| Mistral | 7B–12B | LoRA / QLoRA | |
+| Qwen 2.5 | 1.5B–7B | Full / LoRA / QLoRA | |
+| Phi-3 | 3.8B–8B | LoRA / QLoRA | |
+| Gemma 2 | 2B–9B | LoRA / QLoRA | |
+
+## Fine-Tuning Methods
+
+- **Full** — updates all parameters. Only practical for <3B models on DGX Spark.
+- **LoRA** — trains adapter layers only. Recommended for 3B–31B in BF16.
+- **QLoRA** — 4-bit NF4 + LoRA. For models where BF16 doesn't fit. Note: Gemma-4 auto-downgrades to LoRA (see gotchas).
+
+## Mini vs Full Training
+
+Always do a mini run first to validate the pipeline end-to-end before committing to a full run.
+
+| Run | Samples | Est. time (DGX Spark GB10) |
+|-----|---------|---------------------------|
+| mini-medical | 100,000 | ~10 days (234 hrs) |
+| full-medical | 2,187,808 | ~213 days (5,110 hrs) |
+
+> **Note on timing:** Original estimates assumed ~466 tok/s. Actual throughput with
+> `gradient_checkpointing=True` is ~122 tok/s (3.8× slower — grad-ckpt recomputes activations
+> on the backward pass across all 60 layers). Measured from the first two mini-medical steps
+> at ~537 s/step (1,566 total steps). The full 2.2M run is ~7 months on a single GB10 —
+> consider reducing `max_length` (2048→1024) or `gradient_accumulation_steps` (32→8) to
+> trade batch size for throughput before committing to it.
 
 ```bash
+# Mini run (100k samples — validation)
+python finetune_dgx_spark.py \
+    --model gemma-4-31b --method qlora \
+    --dataset /home/ubuntu/medAI/medical_train.parquet \
+    --question-col question --answer-col answer \
+    --max-samples 100000 --output-dir output/gemma4_mini_medical
+
+# Full run (2.2M samples)
+python finetune_dgx_spark.py \
+    --model gemma-4-31b --method qlora \
+    --dataset /home/ubuntu/medAI/medical_train.parquet \
+    --question-col question --answer-col answer \
+    --output-dir output/gemma4_full_medical
+```
+
+## Monitoring
+
+```bash
+# Tail the training log
+tail -f output/gemma4_mini_medical/train.log
+
 # TensorBoard
-tensorboard --logdir output/logs
+tensorboard --logdir output/gemma4_mini_medical/logs
 
-# Check GPU usage
-nvidia-smi -l 1
+# GPU state
+nvidia-smi
 ```
 
-## 🧪 Test Your Model
+## Inference
 
 ```bash
-python scripts/finetune_dgx_spark.py \
+python finetune_dgx_spark.py \
     --inference \
-    --model-path output/merged_model \
-    --prompt "Your test prompt here"
+    --model-path output/gemma4_mini_medical/final_model/merged_model \
+    --prompt "What are the early signs of type-2 diabetes?"
 ```
 
-## 📝 License
+---
 
-MIT License - Use freely for any purpose.
+## DGX Spark Lessons Learned
+
+Hard-won compatibility notes for training on the GB10 Blackwell (SM 12.1, CUDA 13, 128 GB unified memory).
+
+### Required environment variables
+
+Every training session must set these before running:
+
+```bash
+export TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH=/usr/local/cuda-13.0/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:${LD_LIBRARY_PATH}
+export PYTORCH_ALLOC_CONF=expandable_segments:True   # NOT the old PYTORCH_CUDA_ALLOC_CONF
+source /home/ubuntu/venv/bin/activate
+```
+
+### Python venv
+
+Use `/home/ubuntu/venv` (Python 3.12, `torch 2.9.0+cu130`). This is the only venv with working
+CUDA support — the nanochat `.venv` (Python 3.10) installs CPU-only PyTorch because the
+`cu130` index has no aarch64 Python 3.10 wheel.
+
+### PyTorch 2.9 + SM 12.1 (GB10)
+
+PyTorch 2.9 officially supports SM 8.0–12.0. GB10 is SM 12.1 — technically out-of-spec.
+PyTorch prints a warning but runs correctly. CUDAGraphs are the one exception (see below).
+
+```
+UserWarning: Found GPU0 NVIDIA GB10 which is of cuda capability 12.1.
+Minimum and Maximum cuda capability supported by this version of PyTorch is (8.0) - (12.0)
+```
+This warning is **informational only** — training proceeds correctly.
+
+### CUDAGraphs broken on SM 12.1 (post NVIDIA driver update)
+
+`torch.compile(mode='max-autotune', dynamic=False)` enables CUDAGraph trees by default.
+After a NVIDIA driver update (driver 580.142+), CUDAGraph replay corrupts the wte embedding
+tensor, causing:
+
+```
+RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten
+```
+
+**Fix** — add this line once per optimizer step, **before** the gradient accumulation loop:
+
+```python
+torch.compiler.cudagraph_mark_step_begin()
+for micro_step in range(grad_accum_steps):
+    loss = model(x, y)
+    ...
+```
+
+This is applied in `nanochat/scripts/base_train.py`.
+
+### Gemma-4-31B specific gotchas
+
+**1. QLoRA auto-downgrades to LoRA**
+`Gemma4ClippableLinear` wraps projections and is incompatible with bitsandbytes PEFT injection.
+The script detects this and auto-switches to BF16 LoRA. With 128 GB unified memory this fits:
+~62 GB model + ~3 GB activations (grad-ckpt) + ~2 GB LoRA/Adam ≈ **67 GB peak**.
+
+**2. Use `Gemma4ForCausalLM`, not `AutoModelForCausalLM`**
+`AutoModelForCausalLM` resolves to `Gemma4ForConditionalGeneration` (the VLM), which has a
+custom loss path that disconnects gradients when TRL's `padding_free` mode is active.
+The script explicitly imports and uses `Gemma4ForCausalLM` (text-only decoder).
+
+**3. LoRA targets `.linear` sub-modules**
+`Gemma4ClippableLinear` wraps inner `nn.Linear` at `.linear`. PEFT must target
+`q_proj.linear`, `k_proj.linear`, etc. — not `q_proj` directly.
+`_find_lora_target_modules()` auto-detects this at runtime.
+
+**4. `gradient_checkpointing = True` is MANDATORY**
+Without it, all 60 layers' activations live simultaneously during backprop (~25 GB peak).
+Combined with the 62 GB BF16 model this caused **hard system reboots** (no error — just reboot).
+`torch.compile` is already disabled for Gemma-4, so the old compile+grad-ckpt recompile
+cascade no longer applies. Always keep `gradient_checkpointing=True`.
+
+**5. SDPA attention (no flash_attn)**
+`flash_attn` wheel cannot be installed on CUDA 13 / SM 12.1 (ABI mismatch).
+Use `attn_implementation="sdpa"` — PyTorch's `F.scaled_dot_product_attention` dispatches
+to cuDNN's Blackwell-native FlashAttention kernel automatically.
+
+**6. `torch.compile` disabled for Gemma-4 LoRA**
+Repeated recompile cascades on SM 12.1 with LoRA autograd. Do not re-enable.
+
+### TRL SFTTrainer warnings (benign)
+
+```
+[RANK 0] Padding-free training is enabled, but the attention implementation is not set
+to a supported flash attention variant...
+```
+These appear because `flash_attn` is unavailable. Training proceeds correctly.
+Same trade-off nanochat makes with continuous token packing. Safe to ignore.
+
+### Deprecated API: use `warmup_steps` not `warmup_ratio`
+
+`warmup_ratio` is deprecated in transformers and will be removed in v5.2.
+
+```python
+# Old (deprecated — causes warning):
+SFTConfig(warmup_ratio=0.03, ...)
+
+# Correct:
+SFTConfig(warmup_steps=100, ...)
+```
+
+`warmup_steps=100` is used in this repo (suitable for both mini and full medical runs).
+
+### nvidia-smi memory quirk
+
+`nvidia-smi --query-gpu=memory.total` returns `[N/A]` for the GB10 — expected, because
+it uses unified (CPU+GPU) memory. Use `free -h` to see total system memory instead.
+
+---
+
+## Post-Training: NVFP4 Quantization
+
+After training completes, convert the merged BF16 model to NVFP4 for maximum DGX Spark
+inference performance:
+
+```bash
+python quantize_to_nvfp4.py \
+    --model-path output/gemma4_mini_medical/final_model/merged_model \
+    --output-path output/gemma4_mini_medical_nvfp4 \
+    --calibration-data /home/ubuntu/medAI/medical_train.parquet \
+    --num-calibration-samples 512
+```
+
+## License
+
+MIT
