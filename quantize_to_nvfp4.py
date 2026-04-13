@@ -106,7 +106,7 @@ def quantize_to_nvfp4(
     """
     try:
         import modelopt.torch.quantization as mtq
-        from modelopt.torch.export import export_hf
+        from modelopt.torch.export import export_hf_checkpoint as export_hf
     except ImportError:
         raise ImportError(
             "nvidia-modelopt is required.\n"
@@ -155,11 +155,11 @@ def quantize_to_nvfp4(
             if (i + 1) % 20 == 0:
                 logger.info(f"  Calibration batch {i+1}/{len(cal_loader)}")
 
-    # FP4 quantisation config
-    # FP4_DEFAULT_CFG quantises linear weight layers to NVIDIA FP4 with
-    # per-block (128-element) scale factors stored in FP8.
+    # NVFP4 quantisation config (modelopt ≥0.21: NVFP4_DEFAULT_CFG)
+    # Quantises linear weight layers to NVIDIA FP4 with per-block (128-element)
+    # scale factors stored in FP8. Compatible with vLLM --quantization fp4.
     logger.info("Quantising to NVFP4 …")
-    quant_cfg = mtq.FP4_DEFAULT_CFG
+    quant_cfg = mtq.NVFP4_DEFAULT_CFG
     mtq.quantize(model, quant_cfg, forward_loop)
     logger.info("Quantisation complete.")
 
