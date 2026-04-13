@@ -301,6 +301,47 @@ SFTConfig(warmup_steps=100, ...)
 `nvidia-smi --query-gpu=memory.total` returns `[N/A]` for the GB10 — expected, because
 it uses unified (CPU+GPU) memory. Use `free -h` to see total system memory instead.
 
+### Always use `logging_steps=1` for large model training
+
+With `logging_steps=25` and ~610 s/step, the first loss reading arrives after **4+ hours**
+and the second after **8+ hours**. If the run is diverging you've wasted most of a day
+before seeing any signal. Set `logging_steps=1` — the I/O overhead per step is negligible
+(<0.001% of step time) and you know within 20 minutes whether training is healthy.
+
+Additionally: loss from HuggingFace Trainer goes to TensorBoard (`report_to=["tensorboard"]`),
+not stdout. tqdm's `\r` carriage returns overwrite any `{'loss': ...}` console prints in the
+log file. The monitor script must read from the TensorBoard events file directly, not from
+`train.log`. And it must use `/home/ubuntu/venv/bin/python3` — **system `python3` does not
+have tensorflow** and will silently return `loss=N/A` every cycle.
+
+### vLLM must be Docker-served, not pip-installed into the training venv
+
+Standard PyPI vLLM is built against CUDA 11.x/12.x and does not support CUDA 13 / SM 12.1
+(GB10 Blackwell). Do **not** `pip install vllm` into `/home/ubuntu/venv` — it will either
+fail to install or install an incompatible CUDA runtime that breaks the training environment.
+
+Use the pre-pulled Docker image instead:
+```
+vllm/vllm-openai:gemma4-cu130   (21.9 GB, already on disk)
+```
+This image has the correct CUDA 13 build and full SM 12.1 support. See `scripts/serve_model.sh`.
+
+### nvidia-modelopt API changes (0.21 → 0.42)
+
+The quantisation config and export function were renamed between modelopt 0.21 and 0.42:
+
+| Older (0.21) | Current (0.42+) |
+|---|---|
+| `mtq.FP4_DEFAULT_CFG` | `mtq.NVFP4_DEFAULT_CFG` |
+| `from modelopt.torch.export import export_hf` | `from modelopt.torch.export import export_hf_checkpoint` |
+
+Installed version: **0.42.0**. The `quantize_to_nvfp4.py` script uses the current API.
+If you upgrade modelopt, verify these names haven't changed again with:
+```bash
+python3 -c "import modelopt.torch.quantization as mtq; print([x for x in dir(mtq) if 'FP4' in x])"
+python3 -c "import modelopt.torch.export as e; print([x for x in dir(e) if 'export' in x.lower()])"
+```
+
 ---
 
 ## Post-Training: One-Shot Pipeline
