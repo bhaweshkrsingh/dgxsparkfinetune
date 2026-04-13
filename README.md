@@ -303,17 +303,56 @@ it uses unified (CPU+GPU) memory. Use `free -h` to see total system memory inste
 
 ---
 
-## Post-Training: NVFP4 Quantization
+## Post-Training: One-Shot Pipeline
 
-After training completes, convert the merged BF16 model to NVFP4 for maximum DGX Spark
-inference performance:
+When training completes, run the single post-training script in `/home/ubuntu/docLlms`:
+
+```bash
+bash /home/ubuntu/docLlms/scripts/post_training.sh
+```
+
+This does everything in sequence automatically:
+1. Verifies the merged BF16 model exists
+2. Quantises to NVFP4 (nvidia-modelopt)
+3. Updates `registry.yaml` status: `training` → `ready`
+4. Launches vLLM via Docker (`vllm/vllm-openai:gemma4-cu130`)
+5. Waits for vLLM health check
+6. Restarts Gradio UI (now connects to live model)
+
+Or run quantisation alone:
 
 ```bash
 python quantize_to_nvfp4.py \
-    --model-path output/gemma4_mini_medical/final_model/merged_model \
-    --output-path output/gemma4_mini_medical_nvfp4 \
-    --calibration-data /home/ubuntu/medAI/medical_train.parquet \
+    --model-path  output/pediatrician_gemma/final_model/merged_model \
+    --output-path output/pediatrician_gemma_nvfp4 \
+    --calibration-data /home/ubuntu/medAI/pediatrics_50k.parquet \
     --num-calibration-samples 512
+```
+
+### NVFP4 quantization — version notes
+
+Requires `nvidia-modelopt>=0.21.0` (0.42.0 installed). API changes from older versions:
+
+| Older API | Current (0.42.0+) |
+|-----------|-------------------|
+| `mtq.FP4_DEFAULT_CFG` | `mtq.NVFP4_DEFAULT_CFG` |
+| `from modelopt.torch.export import export_hf` | `from modelopt.torch.export import export_hf_checkpoint as export_hf` |
+
+The script handles both automatically. Use `NVFP4_DEFAULT_CFG` for standard quantisation;
+`NVFP4_AWQ_LITE_CFG` for better accuracy at slight speed cost.
+
+### vLLM serving (Docker)
+
+vLLM is served via Docker, not pip — the `vllm/vllm-openai:gemma4-cu130` image (21.9 GB,
+already pulled) contains the correct CUDA 13 / SM 12.1 build. Do not `pip install vllm`
+into the training venv.
+
+```bash
+# Serve PediatricianGemma (BF16 or NVFP4 — auto-detected)
+bash /home/ubuntu/docLlms/scripts/serve_model.sh pediatrician
+
+# Test
+curl http://localhost:8101/v1/models
 ```
 
 ## License
