@@ -694,7 +694,7 @@ class FineTuner:
             train_dataset      = sft_dataset,
             eval_dataset       = eval_dataset,
             peft_config        = None,
-            callbacks          = [MemoryMonitorCallback()],
+            callbacks          = [MemoryMonitorCallback(), DiagnosticCallback(self.model)],
         )
 
         logger.info("Starting SFT training …")
@@ -822,6 +822,77 @@ class MemoryMonitorCallback(TrainerCallback):
         if state.global_step % 50 == 0 and torch.cuda.is_available():
             alloc = torch.cuda.memory_allocated() / 1e9
             logger.debug(f"Step {state.global_step}: GPU mem = {alloc:.2f} GB")
+
+
+class DiagnosticCallback(TrainerCallback):
+    """
+    Enhanced training diagnostics — logged to TensorBoard every step.
+
+    Metrics added:
+      perplexity        — exp(loss); more readable than raw CE loss
+      loss_delta        — step-over-step change; negative = converging
+      loss_spike        — 1.0 if loss rose >15% vs previous step (instability flag)
+      lora_B_norm_mean  — mean Frobenius norm of all LoRA B matrices
+      lora_B_norm_max   — max  Frobenius norm of all LoRA B matrices
+                          B is zero-initialised, so these start at 0 and grow
+                          as the adapters learn. Staying near 0 = dead training.
+      lora_grad_norm_max  — max  LoRA param gradient norm, captured pre-clip
+      lora_grad_norm_mean — mean LoRA param gradient norm, captured pre-clip
+                            Complements the overall grad_norm; helps pinpoint
+                            which adapter layers are driving gradient explosions.
+    """
+
+    def __init__(self, model: torch.nn.Module):
+        self.model = model
+        self._prev_loss: Optional[float] = None
+        self._lora_grad_max: float = 0.0
+        self._lora_grad_mean: float = 0.0
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        """Capture LoRA gradient norms before the optimizer step clips them."""
+        norms = [
+            p.grad.detach().float().norm().item()
+            for n, p in self.model.named_parameters()
+            if p.grad is not None and ("lora_A" in n or "lora_B" in n)
+        ]
+        if norms:
+            self._lora_grad_max  = max(norms)
+            self._lora_grad_mean = sum(norms) / len(norms)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs:
+            return
+        import math
+
+        loss = logs.get("loss")
+        if loss is not None:
+            # Perplexity — cap at exp(20) ≈ 485M to avoid inf on early chaotic steps
+            logs["perplexity"] = round(math.exp(min(loss, 20.0)), 2)
+
+            # Step-over-step delta and spike flag
+            if self._prev_loss is not None:
+                logs["loss_delta"] = round(loss - self._prev_loss, 6)
+                logs["loss_spike"] = 1.0 if loss > self._prev_loss * 1.15 else 0.0
+            self._prev_loss = loss
+
+        # LoRA B matrix norms — zero at init, grow as adapters learn
+        # Using only B (not A) because B starts at 0; cheap single norm per param.
+        try:
+            b_norms = [
+                p.detach().float().norm().item()
+                for n, p in self.model.named_parameters()
+                if "lora_B" in n and p.requires_grad
+            ]
+            if b_norms:
+                logs["lora_B_norm_mean"] = round(sum(b_norms) / len(b_norms), 6)
+                logs["lora_B_norm_max"]  = round(max(b_norms), 6)
+        except Exception:
+            pass
+
+        # Pre-clip LoRA gradient norms (captured in on_pre_optimizer_step)
+        if self._lora_grad_max > 0:
+            logs["lora_grad_norm_max"]  = round(self._lora_grad_max, 4)
+            logs["lora_grad_norm_mean"] = round(self._lora_grad_mean, 6)
 
 
 # =============================================================================

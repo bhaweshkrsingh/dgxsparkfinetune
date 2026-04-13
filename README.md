@@ -109,18 +109,72 @@ python finetune_dgx_spark.py \
     --output-dir output/gemma4_full_medical
 ```
 
-## Monitoring
+## Training Observability — See Inside Every Step
+
+> **Why this matters:**
+> With Gemma-4-31B at ~610 s/step, `logging_steps=25` means your first loss reading arrives
+> after **4+ hours** and the second after **8+ hours**. If the loss is flat or rising you've
+> already wasted most of a day. We set `logging_steps=1` and added a `DiagnosticCallback` so
+> you know within the **first two steps** whether training is healthy.
+
+### Metrics logged every optimizer step
+
+| Metric | What it tells you | Healthy signal |
+|--------|-------------------|----------------|
+| `train/loss` | Cross-entropy loss | Decreasing |
+| `train/perplexity` | `exp(loss)` — intuitive scale | Decreasing; target 2–20 for SFT |
+| `train/loss_delta` | Step-over-step change | Negative from step 2 onward |
+| `train/loss_spike` | `1.0` if loss rose >15% vs prev step | Stays at 0 |
+| `train/grad_norm` | Overall gradient norm (pre-clip) | High early, stabilises after warmup |
+| `train/lora_B_norm_mean` | Mean Frobenius norm of all LoRA B matrices | Starts at **0.0** (B is zero-init), rises as adapters learn — **stuck at 0 = dead training** |
+| `train/lora_B_norm_max` | Max Frobenius norm across LoRA B matrices | Same signal, highlights hottest layer |
+| `train/lora_grad_norm_max` | Max LoRA param gradient norm (pre-clip) | Tells you *which* layer is driving gradient explosions |
+| `train/lora_grad_norm_mean` | Mean LoRA param gradient norm (pre-clip) | Complements overall grad_norm |
+| `train/learning_rate` | Current LR (warmup → cosine decay) | Ramps up to peak, then decays |
+| `train/mean_token_accuracy` | Token prediction accuracy | Increases as model learns |
+| `train/entropy` | Output distribution entropy | Should decrease as model becomes more confident |
+
+### How to monitor
 
 ```bash
-# Tail the training log
-tail -f output/gemma4_mini_medical/train.log
+# Background monitor → status.log every 2 min (reads TensorBoard events, not stdout)
+nohup bash monitor_training.sh \
+    output/pediatrician_gemma/train.log \
+    output/pediatrician_gemma/status.log 120 > /dev/null 2>&1 &
 
-# TensorBoard
-tensorboard --logdir output/gemma4_mini_medical/logs
+# Tail the status log (loss + step + RAM every 2 min)
+tail -f output/pediatrician_gemma/status.log
 
-# GPU state
-nvidia-smi
+# TensorBoard (full metrics dashboard)
+tensorboard --logdir output/pediatrician_gemma/runs
+
+# Raw training stdout
+tail -f output/pediatrician_gemma/train.log
 ```
+
+### Why loss doesn't appear in train.log
+
+The Trainer is configured with `report_to=["tensorboard"]`. The `{'loss': ...}` console print
+is overwritten by tqdm's `\r` carriage returns in the log file. Loss is always written to the
+TensorBoard events file under `output/<run>/runs/`. The monitor script reads directly from
+there — not from stdout — so `status.log` always shows the real loss.
+
+### Reading the diagnostic signals
+
+**Step 1–2 (within the first ~20 minutes):**
+- `loss_delta` should be negative. If it's positive or zero at step 2, the LR or LoRA rank is wrong.
+- `lora_B_norm_mean` should be moving away from 0. If it stays exactly 0 after warmup starts, gradients are not reaching the adapters.
+
+**Steps 1–100 (warmup phase):**
+- `lora_grad_norm_max` will be very high (thousands). This is normal — LoRA A is randomly initialised and gradients are large before the model finds its footing. They should drop sharply once LR peaks.
+- `loss_spike=1.0` occasionally during warmup is acceptable. Sustained spikes after warmup indicate instability — reduce LR.
+
+**After step 100 (post-warmup, cosine decay begins):**
+- `loss` and `perplexity` should be on a clear downward trend.
+- `lora_B_norm_mean` should be steadily growing.
+- `lora_grad_norm_max` should have settled to <100.
+
+**Do not declare training successful until loss is visibly decreasing across at least 3 consecutive logged steps post-warmup.**
 
 ## Inference
 
