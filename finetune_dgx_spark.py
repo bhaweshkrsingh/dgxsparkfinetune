@@ -55,6 +55,71 @@ from peft import (
     TaskType,
 )
 
+# ── Transformers 4.56+ tokenizer monkey-patch ────────────────────────────────
+# Bug in transformers 4.56.x–4.57.x: _set_model_specific_special_tokens has
+# signature `list[str]` (matching Gemma-4's tokenizer_config extra_special_tokens)
+# but the body calls .keys()/.items(), which are dict methods.  This crashes when
+# loading the Gemma-4-31B tokenizer whose config has:
+#   "extra_special_tokens": ["<|video|>"]   ← list, not dict
+# Fix: guard on dict; skip list inputs (the <|video|> video token is irrelevant
+# for text-only medical fine-tuning and can safely be left unregistered).
+def _patch_set_model_specific_special_tokens():
+    try:
+        from transformers import PreTrainedTokenizerBase
+        from transformers.tokenization_utils_base import AddedToken
+        original = getattr(PreTrainedTokenizerBase, "_set_model_specific_special_tokens", None)
+        if original is None:
+            return  # older transformers without this method — nothing to patch
+
+        def _safe_set(self, special_tokens):
+            if not isinstance(special_tokens, dict):
+                return  # list input (e.g. ["<|video|>"]) — skip silently
+            self.SPECIAL_TOKENS_ATTRIBUTES = self.SPECIAL_TOKENS_ATTRIBUTES + list(special_tokens.keys())
+            for key, value in special_tokens.items():
+                if isinstance(value, (str, AddedToken)):
+                    self._special_tokens_map[key] = value
+
+        PreTrainedTokenizerBase._set_model_specific_special_tokens = _safe_set
+    except Exception:
+        pass  # never crash the training over a patch
+
+_patch_set_model_specific_special_tokens()
+
+
+# ── Gemma-4 chat-template {% generation %} patch ─────────────────────────────
+# TRL 1.0 assistant_only_loss uses tokenizer.apply_chat_template(
+#   ..., return_assistant_tokens_mask=True) which requires {% generation %} /
+# {% endgeneration %} markers in the Jinja2 template to identify which tokens
+# are the model response.  Gemma-4's shipped template (as of Apr 2026) lacks
+# these markers.  We patch them in at runtime, right before the two places
+# where the model-role content is rendered:
+#   1. string content:  {{- strip_thinking(message['content']) -}}
+#   2. sequence items:  {{- strip_thinking(item['text']) -}}
+def _patch_gemma4_chat_template_for_generation_markers(tokenizer) -> None:
+    """Add {% generation %} markers to Gemma-4 chat template if missing."""
+    tmpl = getattr(tokenizer, "chat_template", None)
+    if tmpl is None or "{% generation %}" in tmpl:
+        return  # already patched or not a template tokenizer
+
+    # Pattern 1 — string message content for model role
+    old1 = "{{- strip_thinking(message['content']) -}}"
+    new1 = "{% generation %}{{- strip_thinking(message['content']) -}}{% endgeneration %}"
+
+    # Pattern 2 — sequence item text content for model role
+    old2 = "{{- strip_thinking(item['text']) -}}"
+    new2 = "{% generation %}{{- strip_thinking(item['text']) -}}{% endgeneration %}"
+
+    if old1 not in tmpl and old2 not in tmpl:
+        logger.warning(
+            "Gemma-4 chat template {% generation %} patch: expected patterns not found. "
+            "Template may have changed upstream. assistant_only_loss may not work correctly."
+        )
+        return
+
+    patched = tmpl.replace(old1, new1).replace(old2, new2)
+    tokenizer.chat_template = patched
+    logger.info("Patched Gemma-4 chat template with {% generation %} markers for assistant_only_loss.")
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -70,9 +135,13 @@ logger = logging.getLogger(__name__)
 # These are safe global settings; no GPU ops have run yet at import time.
 # TF32: uses tensor cores for matmul/conv while keeping BF16 range → free speedup.
 # cudnn.benchmark: lets cuDNN pick the fastest algorithm for each kernel shape.
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32       = True
-torch.backends.cudnn.benchmark        = True
+# PyTorch 2.9: allow_tf32 replaced by fp32_precision="tf32"; keep legacy fallback.
+try:
+    torch.backends.cuda.matmul.fp32_precision = "tf32"   # PyTorch 2.9+
+except AttributeError:
+    torch.backends.cuda.matmul.allow_tf32 = True          # PyTorch ≤ 2.8
+torch.backends.cudnn.allow_tf32  = True
+torch.backends.cudnn.benchmark   = True
 
 
 # =============================================================================
@@ -276,19 +345,39 @@ class DatasetPreparator:
             dataset = dataset.select(range(min(num_samples, len(dataset))))
         logger.info(f"Dataset size: {len(dataset):,} samples")
 
-        def format_sample(example):
-            question = example.get(q_col) or example.get(instruction_col, "")
-            answer   = example.get(a_col) or example.get(output_col, "")
-            extra    = example.get(input_col, "")
+        # For SFTTrainer (tokenize=False) produce a 'messages' column in
+        # conversational format so TRL can apply the chat template itself and
+        # correctly mask prompt tokens when assistant_only_loss=True.
+        # For the standard Trainer (tokenize=True) keep the pre-formatted 'text'.
+        assistant_role = (
+            "model"
+            if "gemma" in (self.tokenizer.name_or_path or "").lower()
+            else "assistant"
+        )
 
-            text = self._apply_template(question, answer, extra)
-            return {"text": text}
+        if not tokenize:
+            def format_sample(example):
+                question = example.get(q_col) or example.get(instruction_col, "")
+                answer   = example.get(a_col) or example.get(output_col, "")
+                extra    = example.get(input_col, "")
+                user_content = f"{question}\n\n{extra}".strip() if extra else question
+                return {"messages": [
+                    {"role": "user",          "content": user_content},
+                    {"role": assistant_role,  "content": answer},
+                ]}
+        else:
+            def format_sample(example):
+                question = example.get(q_col) or example.get(instruction_col, "")
+                answer   = example.get(a_col) or example.get(output_col, "")
+                extra    = example.get(input_col, "")
+                text = self._apply_template(question, answer, extra)
+                return {"text": text}
 
         dataset = dataset.map(format_sample, remove_columns=dataset.column_names)
 
         if tokenize:
             return self._tokenize_dataset(dataset)
-        return dataset   # raw 'text' column for SFTTrainer
+        return dataset   # 'messages' column for SFTTrainer with assistant_only_loss
 
     def prepare_conversational_dataset(
         self,
@@ -429,12 +518,18 @@ class FineTuner:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # Patch Gemma-4 chat template with {% generation %} markers so that
+        # TRL's assistant_only_loss can correctly mask prompt tokens.
+        _patch_gemma4_chat_template_for_generation_markers(self.tokenizer)
+
         # Detect Gemma-4 once so all _load_* methods can branch on self._is_gemma4.
+        # The original VLM checkpoint has model_type="gemma4"; the remapped text-only
+        # checkpoint we produce has model_type="gemma4_text". Either indicates Gemma-4.
         self._is_gemma4 = False
         try:
             from transformers import AutoConfig
             _cfg = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
-            if getattr(_cfg, "model_type", "") == "gemma4":
+            if getattr(_cfg, "model_type", "").startswith("gemma4"):
                 self._is_gemma4 = True
         except Exception:
             pass
@@ -467,10 +562,8 @@ class FineTuner:
 
         if self._is_gemma4:
             logger.info(
-                "Gemma-4 model detected — will load Gemma4ForCausalLM (text-only class) "
-                "instead of AutoModelForCausalLM which defaults to Gemma4ForConditionalGeneration "
-                "(the VLM). The text-only class has a standard causal-LM forward pass with "
-                "no multimodal branches, so gradients flow correctly through LoRA layers."
+                "Gemma-4 detected — will remap VLM checkpoint shards to Gemma4ForCausalLM "
+                "namespace (model.language_model.* → model.*) and load text-only model."
             )
 
         dispatch = {
@@ -485,9 +578,6 @@ class FineTuner:
         self._log_memory_usage()
 
     def _model_cls(self):
-        """Return the right from_pretrained class: Gemma4ForCausalLM or AutoModelForCausalLM."""
-        if self._is_gemma4 and _Gemma4ForCausalLM is not None:
-            return _Gemma4ForCausalLM
         return AutoModelForCausalLM
 
     def _load_full_precision_model(self, model_kwargs: Dict):
@@ -497,38 +587,135 @@ class FineTuner:
         logger.info("Loaded model for full fine-tuning (BF16)")
 
     @staticmethod
-    def _find_lora_target_modules(model) -> List[str]:
-        """
-        Auto-detect LoRA target modules at runtime.
-
-        Gemma-4 wraps attention and MLP projections in Gemma4ClippableLinear,
-        which PEFT cannot inject into directly.  This function detects that
-        pattern and returns paths that target the inner nn.Linear instead
-        (e.g. "q_proj.linear" instead of "q_proj").
-        """
+    def _find_lora_target_modules(model):
         standard = ["q_proj", "k_proj", "v_proj", "o_proj",
                     "gate_proj", "up_proj", "down_proj"]
-
-        clippable = set()
-        for name, mod in model.named_modules():
-            if type(mod).__name__ == "Gemma4ClippableLinear":
-                leaf = name.rsplit(".", 1)[-1]
-                if leaf in standard:
-                    clippable.add(leaf)
-
-        if clippable:
-            targets = [f"{t}.linear" for t in standard if t in clippable]
-            logger.info(
-                f"Gemma4ClippableLinear detected on {sorted(clippable)}. "
-                f"Targeting inner .linear sub-modules: {targets}"
-            )
-            return targets
-
+        logger.info(f"LoRA target modules: {standard}")
         return standard
+
+    @staticmethod
+    def _prepare_gemma4_causal_checkpoint(src_path: str, dst_path: str) -> str:
+        """Remap VLM safetensors shards to Gemma4ForCausalLM key namespace.
+
+        google/gemma-4-31b-it is a VLM checkpoint: weights live under
+        model.language_model.* and model.vision_tower.* etc.  Gemma4ForCausalLM
+        (model_type="gemma4_text") expects model.* at the top level.
+
+        This method reads each safetensors shard one at a time (peak ~0.5 GB),
+        extracts only the LM keys (model.language_model.* → model.*), saves new
+        shards, and writes a matching model.safetensors.index.json + config.json
+        with model_type="gemma4_text".  Result is cached at dst_path.
+
+        Returns dst_path (str) — ready for Gemma4ForCausalLM.from_pretrained().
+        """
+        import shutil
+        from pathlib import Path as _Path
+        from transformers import AutoConfig
+
+        src = _Path(src_path)
+        dst = _Path(dst_path)
+
+        # Cache check — skip if already prepared (sentinel: config.json present)
+        if (dst / "config.json").exists():
+            logger.info(f"Gemma4 causal checkpoint already at {dst} — reusing cache.")
+            return str(dst)
+
+        dst.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Preparing Gemma4ForCausalLM checkpoint: {src} → {dst}")
+
+        # --- safetensors imports ---
+        try:
+            from safetensors import safe_open
+            from safetensors.torch import save_file
+        except ImportError:
+            raise ImportError("safetensors package required. Run: pip install safetensors")
+
+        # --- Read shard index ---
+        index_path = src / "model.safetensors.index.json"
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]   # original_key → shard_filename
+
+        all_shards = sorted(set(weight_map.values()))
+        new_weight_map: Dict[str, str] = {}
+
+        for shard_name in all_shards:
+            shard_path = src / shard_name
+            logger.info(f"  Shard {shard_name}: remapping keys …")
+            remapped: Dict[str, Any] = {}
+
+            with safe_open(str(shard_path), framework="pt", device="cpu") as sf:
+                for key in sf.keys():
+                    if key.startswith("model.language_model."):
+                        new_key = key.replace("model.language_model.", "model.", 1)
+                        remapped[new_key] = sf.get_tensor(key)
+                    elif key.startswith("lm_head."):
+                        remapped[key] = sf.get_tensor(key)
+                    # vision/audio encoder keys — dropped
+
+            logger.info(f"    → {len(remapped)} LM keys saved")
+            dst_shard = dst / shard_name
+            save_file(remapped, str(dst_shard))
+
+            for new_key in remapped:
+                new_weight_map[new_key] = shard_name
+
+        # --- Write new shard index ---
+        new_index = {"metadata": {"format": "pt"}, "weight_map": new_weight_map}
+        with open(dst / "model.safetensors.index.json", "w") as f:
+            json.dump(new_index, f, indent=2)
+        logger.info(f"  Written model.safetensors.index.json ({len(new_weight_map)} keys)")
+
+        # --- Write config.json: text_config fields at top level, model_type=gemma4_text ---
+        orig_cfg = AutoConfig.from_pretrained(str(src))
+        text_cfg = orig_cfg.get_text_config()
+        text_cfg_dict = text_cfg.to_dict()
+        text_cfg_dict["model_type"] = "gemma4_text"
+        with open(dst / "config.json", "w") as f:
+            json.dump(text_cfg_dict, f, indent=2)
+        logger.info("  Written config.json (model_type=gemma4_text)")
+
+        # --- Copy tokenizer and generation config files ---
+        for fname in [
+            "tokenizer_config.json", "tokenizer.json", "tokenizer.model",
+            "generation_config.json", "special_tokens_map.json",
+        ]:
+            src_f = src / fname
+            if src_f.exists():
+                shutil.copy2(str(src_f), str(dst / fname))
+                logger.info(f"  Copied {fname}")
+
+        logger.info(f"Gemma4ForCausalLM checkpoint ready at {dst}")
+        return str(dst)
 
     def _load_lora_model(self, model_kwargs: Dict):
         model_kwargs["dtype"] = torch.bfloat16
-        base = self._model_cls().from_pretrained(self.model_name, **model_kwargs)
+
+        if self._is_gemma4:
+            # VLM checkpoint (model.language_model.*) cannot be loaded directly into
+            # Gemma4ForCausalLM (expects model.*). Remap shards to a local cache dir
+            # first, then load the text-only model with correct pretrained weights.
+            # Peak memory: one shard at a time (~0.5 GB) — far less than loading two
+            # full 62 GB models simultaneously.
+            try:
+                from huggingface_hub import snapshot_download
+                src_local = snapshot_download(self.model_name, local_files_only=True)
+            except Exception:
+                src_local = self.model_name   # already a local path
+
+            dst_local = "/home/ubuntu/.cache/gemma4_causal_text"
+            causal_path = self._prepare_gemma4_causal_checkpoint(src_local, dst_local)
+
+            # Force all layers onto GPU 0 (not device_map="auto") to avoid the
+            # meta-device / PEFT backward-pass conflict:
+            #   "MmBackward0 returned an invalid gradient — expected meta but got cuda:0"
+            # device_map="auto" can leave some tensors on meta as disk-offload placeholders;
+            # PEFT LoRA then fails during backward.  62GB BF16 fits on 128GB unified memory.
+            gemma4_kwargs = {**model_kwargs, "device_map": {"": 0}}
+            logger.info(f"Loading Gemma4ForCausalLM from remapped checkpoint: {causal_path}")
+            base = AutoModelForCausalLM.from_pretrained(causal_path, **gemma4_kwargs)
+        else:
+            base = self._model_cls().from_pretrained(self.model_name, **model_kwargs)
 
         target_modules = self._find_lora_target_modules(base)
 
@@ -632,7 +819,7 @@ class FineTuner:
         logger.info(f"  Effective batch     : {effective_batch}")
         logger.info(f"  Learning rate       : {learning_rate}")
         logger.info(f"  Max sequence length : {max_seq_length}")
-        logger.info(f"  Packing             : enabled")
+        logger.info(f"  Packing             : disabled (packing=False avoids SDPA cross-contamination)")
 
         sft_cfg = SFTConfig(
             output_dir                  = str(self.output_dir),
@@ -666,23 +853,29 @@ class FineTuner:
             optim                       = "adamw_torch_fused",
             # SFT-specific ────────────────────────────────────────────
             max_length                  = max_seq_length,   # TRL 1.0: renamed from max_seq_length
-            packing                     = True,
-            dataset_text_field          = "text",
+            # packing=False: TRL 1.0's BFD packing auto-enables padding_free=True, which
+            # flattens sequences into a 1D stream and relies on FlashAttention 2/3 to prevent
+            # cross-sequence attention contamination.  DGX Spark GB10 (SM 12.1 / CUDA 13) has
+            # no prebuilt flash_attn wheel → forced to use SDPA, which does NOT support
+            # padding-free / variable-length packed sequences. Result: tokens from example B
+            # attend to tokens from example A → loss > ln(vocab_size) ≈ 12.45 (worse than
+            # random).  Disabling packing removes this dependency entirely. SDPA with standard
+            # attention masks handles each example independently and correctly.
+            packing                     = False,
+            # Compute loss on assistant (response) tokens only.
+            # Gemma4ForCausalLM is a plain causal decoder — standard CE loss, no VLM
+            # plumbing. The {% generation %} markers patched into the chat template let
+            # TRL's apply_chat_template(return_assistant_tokens_mask=True) correctly
+            # identify response tokens and mask prompt tokens from the loss.
+            assistant_only_loss         = True,
+            # NEFTune: add uniform noise to input embeddings during forward pass.
+            # Empirically improves fine-tuning quality for instruction-following tasks.
+            neftune_noise_alpha         = 5,
+            # Track tokens seen — used by DiagnosticCallback for tokens/sec metric.
+            include_num_input_tokens_seen = "all",
         )
 
-        # No mm_token_type_ids patch needed: we load Gemma4ForCausalLM (text-only)
-        # instead of Gemma4ForConditionalGeneration (VLM).  Gemma4ForCausalLM uses
-        # Gemma4TextModel which has a standard causal-LM forward — no multimodal
-        # token-type routing, no custom loss path, no gradient disconnection.
-        #
-        # Previous approach: monkey-patch forward() to inject mm_token_type_ids=zeros.
-        # Problem: Gemma4ForConditionalGeneration's loss code has a non-standard path
-        # that disconnects gradients when TRL padding_free mode is active (packing +
-        # no flash_attn).  Root cause: TRL auto-enables padding_free=True for the
-        # "bfd" packing strategy, which passes position_ids instead of attention_mask.
-        # The VLM's loss computation then returns a constant tensor with no grad_fn.
-        # Fix: use the text-only model class — same weights, clean forward pass.
-        logger.info("Using Gemma4ForCausalLM (text-only) — no mm_token_type_ids patch needed")
+        logger.info("Starting SFTTrainer setup …")
 
         # LoRA adapters are already applied in _load_lora_model / _load_qlora_model
         # via get_peft_model(). Passing peft_config again to SFTTrainer would
@@ -847,6 +1040,8 @@ class DiagnosticCallback(TrainerCallback):
         self._prev_loss: Optional[float] = None
         self._lora_grad_max: float = 0.0
         self._lora_grad_mean: float = 0.0
+        self._t_last: Optional[float] = None
+        self._tokens_last: int = 0
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
         """Capture LoRA gradient norms before the optimizer step clips them."""
@@ -862,12 +1057,45 @@ class DiagnosticCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not logs:
             return
-        import math
+        import math, time
+
+        # ── tokens/second throughput ─────────────────────────────────────────
+        now = time.monotonic()
+        tokens_seen = getattr(state, "num_input_tokens_seen", None)
+        if tokens_seen is not None and self._t_last is not None:
+            dt = now - self._t_last
+            if dt > 0.0:
+                logs["tokens_per_second"] = round((tokens_seen - self._tokens_last) / dt)
+        if tokens_seen is not None:
+            self._tokens_last = tokens_seen
+        self._t_last = now
 
         loss = logs.get("loss")
         if loss is not None:
             # Perplexity — cap at exp(20) ≈ 485M to avoid inf on early chaotic steps
             logs["perplexity"] = round(math.exp(min(loss, 20.0)), 2)
+
+            # Step-1 sanity check: a properly pretrained 31B model on response-only
+            # tokens should start at loss≈2–4. Loss>10 means tokens are not masked
+            # correctly (loss computed on question tokens) or training is broken.
+            VOCAB_RANDOM_BASELINE = math.log(256_000)  # ln(Gemma-4 vocab) ≈ 12.45
+            if state.global_step <= 5:
+                if loss > VOCAB_RANDOM_BASELINE:
+                    logger.warning(
+                        f"⚠  Step {state.global_step}: loss={loss:.4f} is WORSE than random "
+                        f"(random baseline={VOCAB_RANDOM_BASELINE:.2f}). "
+                        "train_on_responses_only may not be masking prompt tokens correctly."
+                    )
+                elif loss > 6.0:
+                    logger.warning(
+                        f"⚠  Step {state.global_step}: loss={loss:.4f} is high — expected 2–4 "
+                        "for a pretrained 31B model on response tokens. Monitor closely."
+                    )
+                else:
+                    logger.info(
+                        f"✓  Step {state.global_step}: loss={loss:.4f} — looks healthy "
+                        "(expected 2–4 for pretrained 31B on response-only tokens)."
+                    )
 
             # Step-over-step delta and spike flag
             if self._prev_loss is not None:

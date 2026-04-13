@@ -4,7 +4,7 @@
 
 # Core ML Framework
 torch>=2.2.0
-transformers>=4.51.0    # 4.51+ required for Gemma-4 architecture support
+transformers>=5.5.3     # 5.5+ required for Gemma-4 (gemma4 config + Gemma4ForCausalLM)
 datasets>=2.18.0
 accelerate>=0.27.0
 

@@ -15,11 +15,11 @@ high-quality records per medical specialty (~4 days each). Each run produces one
 
 | Model | Dataset | Rows | Status | Est. Finish |
 |-------|---------|------|--------|-------------|
-| PediatricianGemma | `pediatrics_50k.parquet` | 50,000 | **TRAINING** (step ~6/600) | ~Apr 17 2026 |
+| PediatricianGemma | `pediatrics_50k.parquet` | 50,000 | **TRAINING** (~1563 steps, step1 loss=3.10✓) | ~Apr 17 2026 |
 | OncologyGemma | to be extracted | 50,000 | Planned | — |
 | CardiologyGemma | to be extracted | 50,000 | Planned | — |
 | NeurologyGemma | to be extracted | 50,000 | Planned | — |
-| ObGynGemma | to be extracted | 50,000 | Planned | — |
+| ObGynGemma | `obgyn_50k.parquet` | 50,000 | Planned | — |
 
 Dataset source: `/home/ubuntu/medAI/medical_train.parquet` (2,187,808 rows, cols: question/answer)
 Specialty extraction script: keyword-density ranking per specialty — see session notes.
@@ -27,16 +27,21 @@ Specialty extraction script: keyword-density ranking per specialty — see sessi
 ## Quick Start — PediatricianGemma (current run)
 
 ```bash
-# 1. Set your HuggingFace token
-export HF_TOKEN=hf_...
+# Run training (remapped checkpoint cached at /home/ubuntu/.cache/gemma4_causal_text/)
+cd /home/ubuntu/dgxsparkfinetune
+nohup /home/ubuntu/venv/bin/python finetune_dgx_spark.py \
+    --model gemma-4-31b --method qlora \
+    --dataset /home/ubuntu/medAI/pediatrics_50k.parquet \
+    --question-col question --answer-col answer \
+    --epochs 1 --output-dir output/pediatrician_gemma_50k \
+> output/pediatrician_gemma_50k/train.log 2>&1 &
 
-# 2. Run the full pipeline (preprocess → train → quantize)
-chmod +x run_medical_finetune.sh
-./run_medical_finetune.sh
-
-# Or skip stages already done:
-SKIP_INSTALL=1 SKIP_PREPROCESS=1 ./run_medical_finetune.sh
+# Monitor
+tail -f output/pediatrician_gemma_50k/train.log
 ```
+
+> **Important:** Always use `/home/ubuntu/venv/bin/python`, not `python` or `python3`.
+> System `python3` does not have torch.
 
 ## Contents
 
@@ -81,32 +86,32 @@ dgxsparkfinetune/
 
 Always do a mini run first to validate the pipeline end-to-end before committing to a full run.
 
-| Run | Samples | Est. time (DGX Spark GB10) |
-|-----|---------|---------------------------|
-| mini-medical | 100,000 | ~10 days (234 hrs) |
-| full-medical | 2,187,808 | ~213 days (5,110 hrs) |
+| Run | Samples | Steps | Est. time (DGX Spark GB10) |
+|-----|---------|-------|---------------------------|
+| 1k test | 1,000 | 32 | ~2 hours (validates pipeline) |
+| specialty (50k) | 50,000 | ~1,563 | **~4.2 days** (recommended) |
+| full-medical | 2,187,808 | ~68,370 | ~7 months (not recommended) |
 
-> **Note on timing:** Original estimates assumed ~466 tok/s. Actual throughput with
-> `gradient_checkpointing=True` is ~122 tok/s (3.8× slower — grad-ckpt recomputes activations
-> on the backward pass across all 60 layers). Measured from the first two mini-medical steps
-> at ~537 s/step (1,566 total steps). The full 2.2M run is ~7 months on a single GB10 —
-> consider reducing `max_length` (2048→1024) or `gradient_accumulation_steps` (32→8) to
-> trade batch size for throughput before committing to it.
+> **Measured timing:** 235 s/step with batch=1, grad_accum=32, max_length=2048,
+> gradient_checkpointing=True. First validated 2026-04-13 on pediatrics 1k test.
+
+> **Always run the 1k test first.** Confirm step-1 loss is 2–4 and step-2 is declining
+> before committing to a multi-day run.
 
 ```bash
-# Mini run (100k samples — validation)
-python finetune_dgx_spark.py \
+# 1k validation test
+/home/ubuntu/venv/bin/python finetune_dgx_spark.py \
     --model gemma-4-31b --method qlora \
-    --dataset /home/ubuntu/medAI/medical_train.parquet \
+    --dataset /home/ubuntu/medAI/pediatrics_1k.parquet \
     --question-col question --answer-col answer \
-    --max-samples 100000 --output-dir output/gemma4_mini_medical
+    --epochs 1 --output-dir output/test_1k
 
-# Full run (2.2M samples)
-python finetune_dgx_spark.py \
+# Specialty run (50k)
+/home/ubuntu/venv/bin/python finetune_dgx_spark.py \
     --model gemma-4-31b --method qlora \
-    --dataset /home/ubuntu/medAI/medical_train.parquet \
+    --dataset /home/ubuntu/medAI/pediatrics_50k.parquet \
     --question-col question --answer-col answer \
-    --output-dir output/gemma4_full_medical
+    --epochs 1 --output-dir output/pediatrician_gemma_50k
 ```
 
 ## Training Observability — See Inside Every Step
@@ -244,34 +249,53 @@ This is applied in `nanochat/scripts/base_train.py`.
 
 ### Gemma-4-31B specific gotchas
 
-**1. QLoRA auto-downgrades to LoRA**
-`Gemma4ClippableLinear` wraps projections and is incompatible with bitsandbytes PEFT injection.
-The script detects this and auto-switches to BF16 LoRA. With 128 GB unified memory this fits:
-~62 GB model + ~3 GB activations (grad-ckpt) + ~2 GB LoRA/Adam ≈ **67 GB peak**.
+**1. VLM checkpoint key mismatch — shard-by-shard remapping required (THE critical fix)**
 
-**2. Use `Gemma4ForCausalLM`, not `AutoModelForCausalLM`**
-`AutoModelForCausalLM` resolves to `Gemma4ForConditionalGeneration` (the VLM), which has a
-custom loss path that disconnects gradients when TRL's `padding_free` mode is active.
-The script explicitly imports and uses `Gemma4ForCausalLM` (text-only decoder).
+`google/gemma-4-31b-it` is a VLM. Weights are stored under `model.language_model.*`.
+`Gemma4ForCausalLM` (text-only) expects `model.*`.
+**Direct `from_pretrained` silently produces a fully random model — no error, no warning.**
+Observed symptom: step-1 loss of 98–137, which physically exceeds the theoretical max
+of ~72.48 (2×softcap + ln(vocab)) — proving the VLM forward path is broken.
 
-**3. LoRA targets `.linear` sub-modules**
-`Gemma4ClippableLinear` wraps inner `nn.Linear` at `.linear`. PEFT must target
-`q_proj.linear`, `k_proj.linear`, etc. — not `q_proj` directly.
-`_find_lora_target_modules()` auto-detects this at runtime.
+**Fix:** The script runs `_prepare_gemma4_causal_checkpoint()` automatically on first run:
+- Reads each safetensors shard one at a time (~0.5 GB peak RAM)
+- Remaps `model.language_model.*` → `model.*`, drops vision encoder keys
+- Saves to `/home/ubuntu/.cache/gemma4_causal_text/` (cached — skipped on restart)
+- Writes `config.json` with `model_type="gemma4_text"` → loads as `Gemma4ForCausalLM`
+
+**2. `device_map={"": 0}` — not `"auto"` — for PEFT LoRA**
+
+`device_map="auto"` + `get_peft_model()` causes backward pass failure:
+```
+RuntimeError: MmBackward0 returned an invalid gradient — expected meta but got cuda:0
+```
+Fix: force all layers onto GPU 0. 62 GB BF16 fits on 128 GB unified memory.
+
+**3. QLoRA auto-downgrades to LoRA**
+`Gemma4ClippableLinear` wraps projections and is incompatible with bitsandbytes NF4 injection.
+Script auto-switches `qlora` → `lora` (BF16). Peak memory: ~67 GB — safe on 128 GB.
 
 **4. `gradient_checkpointing = True` is MANDATORY**
-Without it, all 60 layers' activations live simultaneously during backprop (~25 GB peak).
-Combined with the 62 GB BF16 model this caused **hard system reboots** (no error — just reboot).
-`torch.compile` is already disabled for Gemma-4, so the old compile+grad-ckpt recompile
-cascade no longer applies. Always keep `gradient_checkpointing=True`.
+Without it, all 60 layers' activations live simultaneously (~25 GB peak) on top of the 62 GB
+model → **hard system reboots** (no error log). `torch.compile` is disabled for Gemma-4 LoRA
+so the old compile+grad-ckpt recompile concern no longer applies. Always keep it enabled.
 
-**5. SDPA attention (no flash_attn)**
-`flash_attn` wheel cannot be installed on CUDA 13 / SM 12.1 (ABI mismatch).
-Use `attn_implementation="sdpa"` — PyTorch's `F.scaled_dot_product_attention` dispatches
-to cuDNN's Blackwell-native FlashAttention kernel automatically.
+**5. `packing = False` required (no flash_attn on CUDA 13)**
+TRL 1.0 packing enables `padding_free=True` which requires flash_attn for correct cross-
+sequence masking. With SDPA only, packed examples contaminate each other → loss worse than
+random. `flash_attn` cannot be installed on CUDA 13 / SM 12.1 (ABI mismatch).
 
-**6. `torch.compile` disabled for Gemma-4 LoRA**
+**6. SDPA attention**
+Use `attn_implementation="sdpa"`. PyTorch SDPA dispatches to cuDNN's Blackwell-native
+FlashAttention kernel on SM 12.1 automatically — no `flash_attn` package needed.
+
+**7. `torch.compile` disabled for Gemma-4 LoRA**
 Repeated recompile cascades on SM 12.1 with LoRA autograd. Do not re-enable.
+
+**Healthy loss baseline:**
+- Step 1 should be **2–4** for a pretrained 31B model on response-only tokens
+- Loss > 6 = suspect. Loss > 12.45 (ln(vocab)) = worse than random. Loss > 72.48 = VLM architecture bug.
+- Confirmed working: Step 1 = 3.10, Step 2 = 2.80 (2026-04-13)
 
 ### TRL SFTTrainer warnings (benign)
 
