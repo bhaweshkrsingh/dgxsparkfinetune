@@ -601,7 +601,7 @@ class FineTuner:
         max_seq_length: int = 2048,
         warmup_steps: int = 100,
         save_steps: int = 500,
-        logging_steps: int = 25,
+        logging_steps: int = 1,
         max_grad_norm: float = 1.0,
     ):
         """
